@@ -5,6 +5,7 @@ import tempfile
 import logging
 import shutil
 import zipfile
+import subprocess
 from io import BytesIO
 from typing import Dict, List, Optional
 
@@ -92,6 +93,25 @@ async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEF
     except Exception as e:
         logger.debug(f"Progress update failed: {e}")
 
+def extract_archive_native(archive_path: str, extract_dir: str, archive_type: str) -> bool:
+    """Extract archive using native libraries (no patool). Returns True on success."""
+    try:
+        if archive_type == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(extract_dir)
+        elif archive_type == "7z":
+            with py7zr.SevenZipFile(archive_path, "r") as szf:
+                szf.extractall(extract_dir)
+        elif archive_type == "rar":
+            # Use patool as fallback for RAR
+            patoolib.extract_archive(archive_path, outdir=extract_dir)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Native extraction failed: {e}")
+        return False
+
 async def convert_archive(
     input_path: str,
     output_path: str,
@@ -99,16 +119,33 @@ async def convert_archive(
     progress_msg_id: int,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
-    """Convert archive to target_type (zip/rar/7z) with progress."""
+) -> tuple[bool, str]:
+    """
+    Convert archive to target_type (zip/rar/7z) with progress.
+    Returns (success, error_message).
+    """
     temp_extract = tempfile.mkdtemp()
     try:
-        patoolib.extract_archive(input_path, outdir=temp_extract)
-        await send_progress(chat_id, progress_msg_id, context, 20)
+        # Determine input archive type
+        input_type = get_archive_type(input_path)
+        if not input_type:
+            return False, "Unknown input archive format"
 
+        # Extract using native method first
+        if not extract_archive_native(input_path, temp_extract, input_type):
+            # Fallback to patool
+            try:
+                patoolib.extract_archive(input_path, outdir=temp_extract)
+            except Exception as e:
+                return False, f"Extraction failed: {str(e)}"
+
+        await send_progress(chat_id, progress_msg_id, context, 30)
+
+        # Count total files for progress
         total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
         processed = 0
 
+        # Create new archive
         if target_type == "zip":
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(temp_extract):
@@ -117,8 +154,8 @@ async def convert_archive(
                         arcname = os.path.relpath(full_path, temp_extract)
                         zf.write(full_path, arcname)
                         processed += 1
-                        if total_files:
-                            percent = 20 + int(70 * processed / total_files)
+                        if total_files > 0:
+                            percent = 30 + int(60 * processed / total_files)
                             await send_progress(chat_id, progress_msg_id, context, min(percent, 90))
         elif target_type == "7z":
             with py7zr.SevenZipFile(output_path, "w") as szf:
@@ -126,17 +163,19 @@ async def convert_archive(
             await send_progress(chat_id, progress_msg_id, context, 90)
         elif target_type == "rar":
             if not is_rar_available():
-                raise RuntimeError("RAR command not installed")
+                return False, "RAR command not installed. Cannot create RAR archives."
+            # patoolib.create_archive expects a list of source files/dirs
             patoolib.create_archive(output_path, [temp_extract])
             await send_progress(chat_id, progress_msg_id, context, 90)
         else:
-            return False
+            return False, f"Unsupported target type: {target_type}"
 
         await send_progress(chat_id, progress_msg_id, context, 100)
-        return True
+        return True, ""
+
     except Exception as e:
-        logger.error(f"Conversion failed: {e}")
-        return False
+        logger.exception("Conversion failed")
+        return False, str(e)
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
@@ -146,10 +185,11 @@ async def clean_branding_in_archive(
     progress_msg_id: int,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
+) -> tuple[bool, str]:
     """
     Extract archive, remove lines matching skip_patterns, keep lines containing 'cookie',
     append channel link to each modified text file. If no modifications, add JOIN_CHANNEL.txt.
+    Returns (success, error_message).
     """
     skip_patterns = [
         r'^[#/;*]', r'checker', r'Checker', r'CHECKER', r'bypass', r'Bypass', r'BYPASS',
@@ -168,11 +208,17 @@ async def clean_branding_in_archive(
 
     archive_type = get_archive_type(input_path)
     if not archive_type:
-        return False
+        return False, "Unknown archive format"
 
     temp_extract = tempfile.mkdtemp()
     try:
-        patoolib.extract_archive(input_path, outdir=temp_extract)
+        # Extract using native method first
+        if not extract_archive_native(input_path, temp_extract, archive_type):
+            try:
+                patoolib.extract_archive(input_path, outdir=temp_extract)
+            except Exception as e:
+                return False, f"Extraction failed: {str(e)}"
+
         await send_progress(chat_id, progress_msg_id, context, 30)
 
         total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
@@ -211,7 +257,7 @@ async def clean_branding_in_archive(
                         logger.warning(f"Could not process {file_path}: {e}")
 
                 processed += 1
-                if total_files:
+                if total_files > 0:
                     percent = 30 + int(40 * processed / total_files)
                     await send_progress(chat_id, progress_msg_id, context, min(percent, 70))
 
@@ -234,17 +280,17 @@ async def clean_branding_in_archive(
                 szf.writeall(temp_extract, arcname="")
         elif archive_type == "rar":
             if not is_rar_available():
-                raise RuntimeError("RAR command not installed")
+                return False, "RAR command not installed. Cannot repack RAR archive after cleaning."
             patoolib.create_archive(output_path, [temp_extract])
         else:
-            return False
+            return False, f"Unsupported archive type: {archive_type}"
 
         await send_progress(chat_id, progress_msg_id, context, 100)
-        return True
+        return True, ""
 
     except Exception as e:
-        logger.error(f"Branding cleaning failed: {e}")
-        return False
+        logger.exception("Branding cleaning failed")
+        return False, str(e)
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
@@ -325,15 +371,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archive_path = context.user_data.get("current_archive")
     original_name = context.user_data.get("original_archive_name", "archive")
 
-    # Helper to check rar command (inline)
-    def rar_available():
-        return shutil.which("rar") is not None
+    if not archive_path or not os.path.exists(archive_path):
+        await query.edit_message_text("❌ Archive not found. Please send the file again.")
+        return
 
     if action == "unzip":
         await query.edit_message_text("📂 Extracting and sending files...")
         extract_dir = tempfile.mkdtemp()
         try:
-            patoolib.extract_archive(archive_path, outdir=extract_dir)
+            # Use native extraction first
+            input_type = get_archive_type(archive_path)
+            if not extract_archive_native(archive_path, extract_dir, input_type):
+                patoolib.extract_archive(archive_path, outdir=extract_dir)
+
             sent_count = 0
             for root, _, files in os.walk(extract_dir):
                 for f in files:
@@ -351,15 +401,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 warn = await query.message.reply_text("⚠️ No valid files found (empty or >50MB).")
                 await store_message(chat_id, warn.message_id)
         except Exception as e:
-            await query.message.reply_text(f"❌ Extraction failed: {e}")
+            await query.message.reply_text(f"❌ Extraction failed: {str(e)}")
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
-            if archive_path and os.path.exists(archive_path):
-                os.unlink(archive_path)
+            os.unlink(archive_path)
             context.user_data.pop("current_archive", None)
+            await query.message.delete()
 
     elif action == "convert":
-        # Show format selection keyboard
+        # Show format selection
         keyboard = [
             [
                 InlineKeyboardButton("📦 ZIP", callback_data="conv_zip"),
@@ -377,16 +427,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action.startswith("conv_"):
         target = action.split("_")[1]  # zip, rar, 7z
-        if target == "rar" and not rar_available():
+        if target == "rar" and not is_rar_available():
             await query.edit_message_text(
                 "❌ **RAR creation is not available on this server.**\n"
                 "Please install `rar` command-line tool or choose ZIP/7z.",
                 parse_mode="Markdown",
             )
-            return
-
-        if not archive_path or not os.path.exists(archive_path):
-            await query.edit_message_text("❌ Archive not found. Please send the file again.")
             return
 
         await query.edit_message_text(f"🔄 Converting to **{target.upper()}**...")
@@ -397,7 +443,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
             out_path = out_tmp.name
 
-        success = await convert_archive(
+        success, error_msg = await convert_archive(
             archive_path, out_path, target,
             progress_msg.message_id, chat_id, context
         )
@@ -409,20 +455,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_msg = await query.message.reply_document(document=bio, filename=new_name)
             await store_message(chat_id, result_msg.message_id)
             await progress_msg.delete()
-            # Cleanup original archive
-            if archive_path and os.path.exists(archive_path):
-                os.unlink(archive_path)
+            os.unlink(archive_path)
             context.user_data.pop("current_archive", None)
-            # Delete the conversion selection message
             await query.message.delete()
         else:
-            await progress_msg.edit_text(f"❌ Conversion to {target.upper()} failed.")
+            await progress_msg.edit_text(f"❌ Conversion to {target.upper()} failed.\nReason: {error_msg[:200]}")
         os.unlink(out_path)
 
     elif action == "back_to_menu":
-        if not archive_path or not os.path.exists(archive_path):
-            await query.edit_message_text("❌ Archive no longer available. Please send again.")
-            return
         keyboard = [
             [
                 InlineKeyboardButton("🔄 Convert", callback_data="convert"),
@@ -441,11 +481,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         progress_msg = await query.message.reply_text("Starting branding removal...")
         await store_message(chat_id, progress_msg.message_id)
 
-        output_ext = os.path.splitext(archive_path)[1] if archive_path else ".zip"
+        output_ext = os.path.splitext(archive_path)[1]
         with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
             out_path = out_tmp.name
 
-        success = await clean_branding_in_archive(
+        success, error_msg = await clean_branding_in_archive(
             archive_path, out_path,
             progress_msg.message_id, chat_id, context
         )
@@ -457,14 +497,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_msg = await query.message.reply_document(document=bio, filename=cleaned_name)
             await store_message(chat_id, result_msg.message_id)
             await progress_msg.delete()
-            # Cleanup original archive
-            if archive_path and os.path.exists(archive_path):
-                os.unlink(archive_path)
+            os.unlink(archive_path)
             context.user_data.pop("current_archive", None)
             await query.message.delete()
         else:
-            await progress_msg.edit_text("❌ Branding cleaning failed.")
-        os.unlink(out_path)
+            await progress_msg.edit_text(f"❌ Branding cleaning failed.\nReason: {error_msg[:200]}")
 
 # ================= MAIN =================
 def main():
