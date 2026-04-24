@@ -76,6 +76,10 @@ def get_archive_type(file_path: str) -> Optional[str]:
         return "7z"
     return None
 
+def is_rar_available() -> bool:
+    """Check if 'rar' command is installed and accessible."""
+    return shutil.which("rar") is not None
+
 async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, percent: int):
     bar_length = 20
     filled = int(bar_length * percent / 100)
@@ -121,6 +125,8 @@ async def convert_archive(
                 szf.writeall(temp_extract, arcname="")
             await send_progress(chat_id, progress_msg_id, context, 90)
         elif target_type == "rar":
+            if not is_rar_available():
+                raise RuntimeError("RAR command not installed")
             patoolib.create_archive(output_path, [temp_extract])
             await send_progress(chat_id, progress_msg_id, context, 90)
         else:
@@ -227,6 +233,8 @@ async def clean_branding_in_archive(
             with py7zr.SevenZipFile(output_path, "w") as szf:
                 szf.writeall(temp_extract, arcname="")
         elif archive_type == "rar":
+            if not is_rar_available():
+                raise RuntimeError("RAR command not installed")
             patoolib.create_archive(output_path, [temp_extract])
         else:
             return False
@@ -315,12 +323,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
 
     archive_path = context.user_data.get("current_archive")
-    if not archive_path or not os.path.exists(archive_path):
-        await query.edit_message_text("❌ Archive not found. Please send the file again.")
-        return
-
     original_name = context.user_data.get("original_archive_name", "archive")
-    archive_type = get_archive_type(archive_path)
+
+    # Helper to check rar command (inline)
+    def rar_available():
+        return shutil.which("rar") is not None
 
     if action == "unzip":
         await query.edit_message_text("📂 Extracting and sending files...")
@@ -347,19 +354,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ Extraction failed: {e}")
         finally:
             shutil.rmtree(extract_dir, ignore_errors=True)
-            os.unlink(archive_path)
+            if archive_path and os.path.exists(archive_path):
+                os.unlink(archive_path)
             context.user_data.pop("current_archive", None)
 
     elif action == "convert":
-        # choose next format: zip -> 7z -> rar -> zip
-        if archive_type == "zip":
-            target = "7z"
-        elif archive_type == "7z":
-            target = "rar"
-        else:
-            target = "zip"
+        # Show format selection keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("📦 ZIP", callback_data="conv_zip"),
+                InlineKeyboardButton("🗜️ RAR", callback_data="conv_rar"),
+                InlineKeyboardButton("📀 7Z", callback_data="conv_7z"),
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🔄 **Select target format:**",
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
 
-        await query.edit_message_text(f"🔄 Converting {archive_type.upper()} → {target.upper()}...")
+    elif action.startswith("conv_"):
+        target = action.split("_")[1]  # zip, rar, 7z
+        if target == "rar" and not rar_available():
+            await query.edit_message_text(
+                "❌ **RAR creation is not available on this server.**\n"
+                "Please install `rar` command-line tool or choose ZIP/7z.",
+                parse_mode="Markdown",
+            )
+            return
+
+        if not archive_path or not os.path.exists(archive_path):
+            await query.edit_message_text("❌ Archive not found. Please send the file again.")
+            return
+
+        await query.edit_message_text(f"🔄 Converting to **{target.upper()}**...")
         progress_msg = await query.message.reply_text("Starting conversion...")
         await store_message(chat_id, progress_msg.message_id)
 
@@ -379,18 +409,39 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_msg = await query.message.reply_document(document=bio, filename=new_name)
             await store_message(chat_id, result_msg.message_id)
             await progress_msg.delete()
+            # Cleanup original archive
+            if archive_path and os.path.exists(archive_path):
+                os.unlink(archive_path)
+            context.user_data.pop("current_archive", None)
+            # Delete the conversion selection message
+            await query.message.delete()
         else:
-            await progress_msg.edit_text("❌ Conversion failed. Check if required tools (rar) are installed.")
+            await progress_msg.edit_text(f"❌ Conversion to {target.upper()} failed.")
         os.unlink(out_path)
-        os.unlink(archive_path)
-        context.user_data.pop("current_archive", None)
+
+    elif action == "back_to_menu":
+        if not archive_path or not os.path.exists(archive_path):
+            await query.edit_message_text("❌ Archive no longer available. Please send again.")
+            return
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Convert", callback_data="convert"),
+                InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
+                InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "✅ Archive received. Choose an action:",
+            reply_markup=reply_markup,
+        )
 
     elif action == "cleaner":
         await query.edit_message_text("🧹 Cleaning branding from archive...")
         progress_msg = await query.message.reply_text("Starting branding removal...")
         await store_message(chat_id, progress_msg.message_id)
 
-        output_ext = os.path.splitext(archive_path)[1]
+        output_ext = os.path.splitext(archive_path)[1] if archive_path else ".zip"
         with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
             out_path = out_tmp.name
 
@@ -406,17 +457,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_msg = await query.message.reply_document(document=bio, filename=cleaned_name)
             await store_message(chat_id, result_msg.message_id)
             await progress_msg.delete()
+            # Cleanup original archive
+            if archive_path and os.path.exists(archive_path):
+                os.unlink(archive_path)
+            context.user_data.pop("current_archive", None)
+            await query.message.delete()
         else:
             await progress_msg.edit_text("❌ Branding cleaning failed.")
         os.unlink(out_path)
-        os.unlink(archive_path)
-        context.user_data.pop("current_archive", None)
-
-    # Delete the original keyboard message
-    try:
-        await query.message.delete()
-    except:
-        pass
 
 # ================= MAIN =================
 def main():
