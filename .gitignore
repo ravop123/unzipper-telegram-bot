@@ -1,37 +1,66 @@
-# Byte-compiled / optimized / DLL files
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
-*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
 
 # Virtual environments
 venv/
 env/
-ENV/
 .env
 .venv
+ENV/
 
-# IDE files
+# IDE / editor files
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Logs and databases
-*.log
-*.sqlite
-*.db
-
-# Bot data (if any)
-*.json
-*.txt
-!requirements.txt
-!Procfile
-
-# OS junk
+*~
 .DS_Store
-Thumbs.db
 
-# Temporary files
+# Environment variables (contains bot token)
+.env
+.env.*
+!.env.example
+
+# Temporary files from bot operations
+temp_*
 *.tmp
 *.temp
 temp/
+downloads/
+extracted/
+*.part
+
+# Logs
+*.log
+logs/
+
+# Flask / web server
+instance/
+.webassets-cache
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Database (if any in future)
+*.db
+*.sqlite
+*.sqlite3
+
+# Archive remnants (extracted/repacked from bot)
+*.zip
+*.rar
+*.7z
+!requirements.txt   # keep requirements file
+
+# Patool / external tool leftovers
+patool_*
