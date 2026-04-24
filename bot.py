@@ -1,70 +1,265 @@
 import os
-import tempfile
+import re
 import asyncio
+import tempfile
 import logging
+import shutil
+import zipfile
 from io import BytesIO
-from flask import Flask
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from typing import Dict, List, Optional
+
 import patoolib
-from patoolib import extract_archive
+import py7zr
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
+CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
 
-# Setup logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Text file extensions to scan for branding
+TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json", ".xml", ".html", ".css", ".js", ".py", ".sh", ".bat"}
+
+# Logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 # Flask app for health checks
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-@app.route('/')
+@flask_app.route("/")
 def home():
     return "Bot is running"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# Store bot message IDs per chat for /clean
-chat_messages = {}
+# Store all message IDs per chat for /clean
+chat_messages: Dict[int, List[int]] = {}
 
-# ================= COMMANDS =================
+# ================= HELPER FUNCTIONS =================
+async def store_message(chat_id: int, message_id: int) -> None:
+    if chat_id not in chat_messages:
+        chat_messages[chat_id] = []
+    chat_messages[chat_id].append(message_id)
+
+async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if chat_id not in chat_messages:
+        return
+    for msg_id in chat_messages[chat_id]:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning(f"Could not delete message {msg_id}: {e}")
+    chat_messages[chat_id].clear()
+
+def get_archive_type(file_path: str) -> Optional[str]:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".zip":
+        return "zip"
+    if ext == ".rar":
+        return "rar"
+    if ext == ".7z":
+        return "7z"
+    return None
+
+async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, percent: int):
+    bar_length = 20
+    filled = int(bar_length * percent / 100)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    text = f"🔄 Processing...\n`[{bar}] {percent}%`"
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.debug(f"Progress update failed: {e}")
+
+async def convert_archive(
+    input_path: str,
+    output_path: str,
+    target_type: str,
+    progress_msg_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Convert archive to target_type (zip/rar/7z) with progress."""
+    temp_extract = tempfile.mkdtemp()
+    try:
+        patoolib.extract_archive(input_path, outdir=temp_extract)
+        await send_progress(chat_id, progress_msg_id, context, 20)
+
+        total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
+        processed = 0
+
+        if target_type == "zip":
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(temp_extract):
+                    for f in files:
+                        full_path = os.path.join(root, f)
+                        arcname = os.path.relpath(full_path, temp_extract)
+                        zf.write(full_path, arcname)
+                        processed += 1
+                        if total_files:
+                            percent = 20 + int(70 * processed / total_files)
+                            await send_progress(chat_id, progress_msg_id, context, min(percent, 90))
+        elif target_type == "7z":
+            with py7zr.SevenZipFile(output_path, "w") as szf:
+                szf.writeall(temp_extract, arcname="")
+            await send_progress(chat_id, progress_msg_id, context, 90)
+        elif target_type == "rar":
+            patoolib.create_archive(output_path, [temp_extract])
+            await send_progress(chat_id, progress_msg_id, context, 90)
+        else:
+            return False
+
+        await send_progress(chat_id, progress_msg_id, context, 100)
+        return True
+    except Exception as e:
+        logger.error(f"Conversion failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(temp_extract, ignore_errors=True)
+
+async def clean_branding_in_archive(
+    input_path: str,
+    output_path: str,
+    progress_msg_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """
+    Extract archive, remove lines matching skip_patterns, keep lines containing 'cookie',
+    append channel link to each modified text file. If no modifications, add JOIN_CHANNEL.txt.
+    """
+    skip_patterns = [
+        r'^[#/;*]', r'checker', r'Checker', r'CHECKER', r'bypass', r'Bypass', r'BYPASS',
+        r'crack', r'Crack', r'CRACK', r'premium', r'Premium', r'PREMIUM',
+        r'free', r'Free', r'FREE', r'hits', r'Hits', r'HITS',
+        r'working', r'Working', r'WORKING', r'valid', r'Valid', r'VALID',
+        r'github', r'GitHub', r'GITHUB', r'telegram', r'Telegram', r'TELEGRAM',
+        r'discord', r'Discord', r'DISCORD', r'join', r'Join', r'JOIN',
+        r'channel', r'Channel', r'CHANNEL', r'group', r'Group', r'GROUP',
+        r'@', r'http', r'www\.', r'\.com', r'\.org', r'\.net',
+        r'Plan:', r'Country:', r'Autopay:', r'Trial:', r'Owner:', r'Email:',
+        r'Max Streams:', r'Payment Method:', r'Member Since:', r'Extra members:',
+        r'Checker By', r'Cookie 👇'
+    ]
+    compiled = [re.compile(p, re.IGNORECASE) for p in skip_patterns]
+
+    archive_type = get_archive_type(input_path)
+    if not archive_type:
+        return False
+
+    temp_extract = tempfile.mkdtemp()
+    try:
+        patoolib.extract_archive(input_path, outdir=temp_extract)
+        await send_progress(chat_id, progress_msg_id, context, 30)
+
+        total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
+        processed = 0
+        modified_any = False
+
+        for root, _, files in os.walk(temp_extract):
+            for file in files:
+                file_path = os.path.join(root, file)
+                ext = os.path.splitext(file)[1].lower()
+                if ext in TEXT_EXTENSIONS:
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            lines = f.readlines()
+
+                        new_lines = []
+                        for line in lines:
+                            # Keep lines containing 'cookie' (case-insensitive)
+                            if re.search(r"cookie", line, re.IGNORECASE):
+                                new_lines.append(line.rstrip('\n'))
+                                continue
+                            # Skip if matches any pattern
+                            if any(p.search(line) for p in compiled):
+                                modified_any = True
+                                continue
+                            new_lines.append(line.rstrip('\n'))
+
+                        # If any line was removed, append channel link at the end
+                        if len(new_lines) != len(lines):
+                            new_lines.append(CHANNEL_LINK)
+                            modified_any = True
+
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write("\n".join(new_lines))
+                    except Exception as e:
+                        logger.warning(f"Could not process {file_path}: {e}")
+
+                processed += 1
+                if total_files:
+                    percent = 30 + int(40 * processed / total_files)
+                    await send_progress(chat_id, progress_msg_id, context, min(percent, 70))
+
+        # If no modification happened, create a new file with the channel link
+        if not modified_any:
+            join_file = os.path.join(temp_extract, "JOIN_CHANNEL.txt")
+            with open(join_file, "w", encoding="utf-8") as f:
+                f.write(CHANNEL_LINK)
+
+        # Repack
+        if archive_type == "zip":
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(temp_extract):
+                    for f in files:
+                        full_path = os.path.join(root, f)
+                        arcname = os.path.relpath(full_path, temp_extract)
+                        zf.write(full_path, arcname)
+        elif archive_type == "7z":
+            with py7zr.SevenZipFile(output_path, "w") as szf:
+                szf.writeall(temp_extract, arcname="")
+        elif archive_type == "rar":
+            patoolib.create_archive(output_path, [temp_extract])
+        else:
+            return False
+
+        await send_progress(chat_id, progress_msg_id, context, 100)
+        return True
+
+    except Exception as e:
+        logger.error(f"Branding cleaning failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(temp_extract, ignore_errors=True)
+
+# ================= TELEGRAM HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Simple welcome message"""
-    await update.message.reply_text(
-        "📦 **Archive Extractor Bot**\n\n"
-        "Send me a `.zip`, `.rar` or `.7z` file and I will extract and send back all inner files.\n\n"
-        "Use `/clean` to delete all messages in this chat (both yours and mine)."
+    msg = await update.message.reply_text(
+        "📦 **Archive Extractor & Converter Bot**\n\n"
+        "Send me a `.zip`, `.rar` or `.7z` file.\n"
+        "I will show you three options:\n"
+        "• **Convert** – change archive format with live progress\n"
+        "• **Unzip** – extract all files\n"
+        "• **Branding Cleaner** – remove Discord/Telegram/etc. branding lines, keep cookie lines, and add our channel link\n\n"
+        "Use `/clean` to delete all messages in this chat (no trace left).",
+        parse_mode="Markdown",
     )
+    await store_message(update.effective_chat.id, msg.message_id)
 
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete all messages from this chat (user + bot)"""
     chat_id = update.effective_chat.id
-    user_msg_id = update.message.message_id
-
-    # Delete the command message itself
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=user_msg_id)
-    except Exception as e:
-        logger.warning(f"Could not delete user command: {e}")
-
-    # Delete all stored bot messages in this chat
-    if chat_id in chat_messages:
-        for msg_id in chat_messages[chat_id]:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except Exception as e:
-                logger.warning(f"Could not delete bot message {msg_id}: {e}")
-        chat_messages[chat_id].clear()
-    else:
-        # If no messages tracked, try to delete the bot's last reply (if any)
-        pass
-
-    # Optional: send a confirmation that gets deleted after 2 seconds
-    confirm = await update.message.reply_text("🧹 Chat cleared")
+    command_msg_id = update.message.message_id
+    await store_message(chat_id, command_msg_id)
+    await delete_stored_messages(chat_id, context)
+    confirm = await update.message.reply_text("🧹 Chat cleared completely.")
     await asyncio.sleep(2)
     try:
         await confirm.delete()
@@ -72,84 +267,156 @@ async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def handle_archive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Extract .zip/.rar/.7z and send inner files (no extra messages)"""
-    user = update.effective_user
-    document = update.message.document
+    user_msg = update.message
+    chat_id = user_msg.chat_id
+    document = user_msg.document
+
+    await store_message(chat_id, user_msg.message_id)
 
     if not document:
         return
 
     filename = document.file_name.lower()
-    if not (filename.endswith('.zip') or filename.endswith('.rar') or filename.endswith('.7z')):
-        # Not an archive – ignore silently (no message)
+    if not (filename.endswith(".zip") or filename.endswith(".rar") or filename.endswith(".7z")):
         return
 
     if document.file_size > MAX_FILE_SIZE:
-        await update.message.reply_text("❌ Archive too large (max 50MB)")
+        error_msg = await user_msg.reply_text("❌ Archive too large (max 50MB)")
+        await store_message(chat_id, error_msg.message_id)
         return
 
-    # Download the archive to a temporary file
+    # Download archive
     file = await context.bot.get_file(document.file_id)
     with tempfile.NamedTemporaryFile(suffix=os.path.splitext(document.file_name)[1], delete=False) as tmp:
         await file.download_to_drive(tmp.name)
         tmp_path = tmp.name
 
-    # Create a temporary directory for extraction
-    extract_dir = tempfile.mkdtemp()
+    context.user_data["current_archive"] = tmp_path
+    context.user_data["original_archive_name"] = document.file_name
 
-    try:
-        # Extract using patool (supports zip, rar, 7z)
-        extract_archive(tmp_path, outdir=extract_dir)
-    except Exception as e:
-        logger.error(f"Extraction failed: {e}")
-        # Send error only once
-        await update.message.reply_text(f"❌ Extraction failed: {str(e)[:100]}")
-        os.unlink(tmp_path)
-        os.rmdir(extract_dir)
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Convert", callback_data="convert"),
+            InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
+            InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    prompt_msg = await user_msg.reply_text(
+        "✅ Archive received. Choose an action:",
+        reply_markup=reply_markup,
+    )
+    await store_message(chat_id, prompt_msg.message_id)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    action = query.data
+
+    archive_path = context.user_data.get("current_archive")
+    if not archive_path or not os.path.exists(archive_path):
+        await query.edit_message_text("❌ Archive not found. Please send the file again.")
         return
 
-    # Walk through extracted files and send each one
-    sent_count = 0
-    for root, dirs, files in os.walk(extract_dir):
-        for f in files:
-            file_path = os.path.join(root, f)
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                continue  # Skip files too large for Telegram
+    original_name = context.user_data.get("original_archive_name", "archive")
+    archive_type = get_archive_type(archive_path)
 
-            with open(file_path, 'rb') as fp:
-                data = fp.read()
-            bio = BytesIO(data)
-            bio.name = f  # keep original filename
+    if action == "unzip":
+        await query.edit_message_text("📂 Extracting and sending files...")
+        extract_dir = tempfile.mkdtemp()
+        try:
+            patoolib.extract_archive(archive_path, outdir=extract_dir)
+            sent_count = 0
+            for root, _, files in os.walk(extract_dir):
+                for f in files:
+                    file_path = os.path.join(root, f)
+                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                        continue
+                    with open(file_path, "rb") as fp:
+                        bio = BytesIO(fp.read())
+                        bio.name = f
+                    sent_msg = await query.message.reply_document(document=bio, filename=f)
+                    await store_message(chat_id, sent_msg.message_id)
+                    sent_count += 1
+                    await asyncio.sleep(0.3)
+            if sent_count == 0:
+                warn = await query.message.reply_text("⚠️ No valid files found (empty or >50MB).")
+                await store_message(chat_id, warn.message_id)
+        except Exception as e:
+            await query.message.reply_text(f"❌ Extraction failed: {e}")
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            os.unlink(archive_path)
+            context.user_data.pop("current_archive", None)
 
-            try:
-                sent_msg = await update.message.reply_document(document=bio, filename=f)
-                sent_count += 1
-                # Store bot message ID for future /clean
-                chat_id = update.effective_chat.id
-                if chat_id not in chat_messages:
-                    chat_messages[chat_id] = []
-                chat_messages[chat_id].append(sent_msg.message_id)
-                await asyncio.sleep(0.3)  # avoid flooding
-            except Exception as e:
-                logger.error(f"Failed to send file {f}: {e}")
+    elif action == "convert":
+        # choose next format: zip -> 7z -> rar -> zip
+        if archive_type == "zip":
+            target = "7z"
+        elif archive_type == "7z":
+            target = "rar"
+        else:
+            target = "zip"
 
-    # Cleanup
-    os.unlink(tmp_path)
-    for root, dirs, files in os.walk(extract_dir, topdown=False):
-        for f in files:
-            os.remove(os.path.join(root, f))
-        for d in dirs:
-            os.rmdir(os.path.join(root, d))
-    os.rmdir(extract_dir)
+        await query.edit_message_text(f"🔄 Converting {archive_type.upper()} → {target.upper()}...")
+        progress_msg = await query.message.reply_text("Starting conversion...")
+        await store_message(chat_id, progress_msg.message_id)
 
-    # If no files were sent (e.g., empty archive, all too large), notify once
-    if sent_count == 0:
-        err_msg = await update.message.reply_text("⚠️ No valid files found inside archive (all empty or >50MB).")
-        chat_id = update.effective_chat.id
-        if chat_id not in chat_messages:
-            chat_messages[chat_id] = []
-        chat_messages[chat_id].append(err_msg.message_id)
+        output_ext = f".{target}"
+        with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
+            out_path = out_tmp.name
+
+        success = await convert_archive(
+            archive_path, out_path, target,
+            progress_msg.message_id, chat_id, context
+        )
+        if success:
+            with open(out_path, "rb") as fp:
+                bio = BytesIO(fp.read())
+                new_name = f"{os.path.splitext(original_name)[0]}.{target}"
+                bio.name = new_name
+            result_msg = await query.message.reply_document(document=bio, filename=new_name)
+            await store_message(chat_id, result_msg.message_id)
+            await progress_msg.delete()
+        else:
+            await progress_msg.edit_text("❌ Conversion failed. Check if required tools (rar) are installed.")
+        os.unlink(out_path)
+        os.unlink(archive_path)
+        context.user_data.pop("current_archive", None)
+
+    elif action == "cleaner":
+        await query.edit_message_text("🧹 Cleaning branding from archive...")
+        progress_msg = await query.message.reply_text("Starting branding removal...")
+        await store_message(chat_id, progress_msg.message_id)
+
+        output_ext = os.path.splitext(archive_path)[1]
+        with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
+            out_path = out_tmp.name
+
+        success = await clean_branding_in_archive(
+            archive_path, out_path,
+            progress_msg.message_id, chat_id, context
+        )
+        if success:
+            with open(out_path, "rb") as fp:
+                bio = BytesIO(fp.read())
+                cleaned_name = f"cleaned_{original_name}"
+                bio.name = cleaned_name
+            result_msg = await query.message.reply_document(document=bio, filename=cleaned_name)
+            await store_message(chat_id, result_msg.message_id)
+            await progress_msg.delete()
+        else:
+            await progress_msg.edit_text("❌ Branding cleaning failed.")
+        os.unlink(out_path)
+        os.unlink(archive_path)
+        context.user_data.pop("current_archive", None)
+
+    # Delete the original keyboard message
+    try:
+        await query.message.delete()
+    except:
+        pass
 
 # ================= MAIN =================
 def main():
@@ -157,18 +424,17 @@ def main():
         print("❌ Please set BOT_TOKEN environment variable.")
         return
 
-    # Start Flask thread
     import threading
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Build bot
-    app_bot = Application.builder().token(BOT_TOKEN).build()
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CommandHandler("clean", clean))
-    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_archive))
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clean", clean))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_archive))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-    print("✅ Bot started. Waiting for archive files...")
-    app_bot.run_polling()
+    print("✅ Bot started. Waiting for archives...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
