@@ -13,15 +13,8 @@ import stat
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
-# MUST set PATH before importing patoolib/rarfile
-BIN_DIR = "/tmp/rar_bins"
-os.makedirs(BIN_DIR, exist_ok=True)
-os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")
-
-# Now import libraries that may use these binaries
-import patoolib
+# Bypass patoolib and rarfile for RAR – we use direct subprocess
 import py7zr
-import rarfile
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -39,7 +32,11 @@ PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
 CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
 
-# URLs for official RARLAB binaries (Linux x64)
+# Binaries will be stored here (writable on Render)
+BIN_DIR = "/tmp/rar_bins"
+os.makedirs(BIN_DIR, exist_ok=True)
+
+# URLs for official RARLAB Linux x64 static binaries
 UNRAR_URL = "https://www.rarlab.com/rar/unrar-6.2.12.tar.gz"
 RAR_URL = "https://www.rarlab.com/rar/rarlinux-x64-6.2.12.tar.gz"
 
@@ -77,96 +74,53 @@ async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message {msg_id}: {e}")
     chat_messages[chat_id].clear()
 
-# ------------------ RAR BINARY DOWNLOADER (FORCED TO WORK) ------------------
-def download_and_extract_tar_gz(url: str, dest_dir: str, binary_name: str) -> Optional[str]:
-    """Download tar.gz, extract, and return absolute path to binary."""
-    try:
-        archive_name = os.path.join(dest_dir, os.path.basename(url))
-        # Download if not already present
-        if not os.path.exists(archive_name):
-            logger.info(f"Downloading {url} ...")
-            urllib.request.urlretrieve(url, archive_name)
-        # Extract
-        with tarfile.open(archive_name, "r:gz") as tar:
-            tar.extractall(dest_dir)
-        # Find binary (it's usually in a subfolder named after the archive)
-        extracted_dir = os.path.join(dest_dir, os.path.splitext(os.path.basename(url))[0].replace(".tar", ""))
-        if not os.path.exists(extracted_dir):
-            # fallback: scan all files in dest_dir for binary_name
-            for root, _, files in os.walk(dest_dir):
-                if binary_name in files:
-                    return os.path.join(root, binary_name)
-        candidate = os.path.join(extracted_dir, binary_name)
-        if os.path.exists(candidate):
-            st = os.stat(candidate)
-            os.chmod(candidate, st.st_mode | stat.S_IEXEC)
-            return candidate
-        return None
-    except Exception as e:
-        logger.error(f"Failed to download/extract {binary_name}: {e}")
-        return None
-
-# Force setup of RAR binaries
+# ------------------ DIRECT RAR BINARY DOWNLOADER ------------------
 UNRAR_BIN = None
 RAR_BIN = None
 
-def setup_rar_binaries():
-    global UNRAR_BIN, RAR_BIN
-    # Download unrar
-    unrar_path = download_and_extract_tar_gz(UNRAR_URL, BIN_DIR, "unrar")
-    if unrar_path:
-        UNRAR_BIN = unrar_path
-        # Also copy to BIN_DIR/unrar for PATH
-        shutil.copy(unrar_path, os.path.join(BIN_DIR, "unrar"))
-        os.chmod(os.path.join(BIN_DIR, "unrar"), 0o755)
-        logger.info(f"✅ unrar installed at {UNRAR_BIN}")
-    else:
-        logger.warning("❌ Failed to install unrar – RAR extraction may fail")
-    
-    # Download rar (for creation)
-    rar_path = download_and_extract_tar_gz(RAR_URL, BIN_DIR, "rar")
-    if rar_path:
-        RAR_BIN = rar_path
-        shutil.copy(rar_path, os.path.join(BIN_DIR, "rar"))
-        os.chmod(os.path.join(BIN_DIR, "rar"), 0o755)
-        logger.info(f"✅ rar installed at {RAR_BIN}")
-    else:
-        logger.warning("❌ Failed to install rar – RAR creation disabled")
+def download_and_extract_binary(url: str, binary_name: str) -> Optional[str]:
+    """Download tar.gz, extract, return absolute path to the binary."""
+    try:
+        archive_path = os.path.join(BIN_DIR, os.path.basename(url))
+        if not os.path.exists(archive_path):
+            logger.info(f"Downloading {url} ...")
+            urllib.request.urlretrieve(url, archive_path)
+        
+        # Extract
+        with tarfile.open(archive_path, "r:gz") as tar:
+            tar.extractall(BIN_DIR)
+        
+        # Find the binary (usually in a subfolder)
+        extracted_dir = os.path.join(BIN_DIR, os.path.splitext(os.path.basename(url))[0].replace(".tar", ""))
+        if os.path.exists(extracted_dir):
+            candidate = os.path.join(extracted_dir, binary_name)
+            if os.path.exists(candidate):
+                os.chmod(candidate, os.stat(candidate).st_mode | stat.S_IEXEC)
+                return candidate
+        
+        # Fallback: search recursively
+        for root, _, files in os.walk(BIN_DIR):
+            if binary_name in files:
+                full_path = os.path.join(root, binary_name)
+                os.chmod(full_path, os.stat(full_path).st_mode | stat.S_IEXEC)
+                return full_path
+        return None
+    except Exception as e:
+        logger.error(f"Failed to setup {binary_name}: {e}")
+        return None
 
-# Run setup immediately
-setup_rar_binaries()
+# Force download binaries at startup
+UNRAR_BIN = download_and_extract_binary(UNRAR_URL, "unrar")
+RAR_BIN = download_and_extract_binary(RAR_URL, "rar")
 
-# Configure rarfile to use our unrar
-if UNRAR_BIN and os.path.exists(UNRAR_BIN):
-    rarfile.UNRAR_TOOL = UNRAR_BIN
-    logger.info(f"rarfile.UNRAR_TOOL set to {UNRAR_BIN}")
+if UNRAR_BIN:
+    logger.info(f"✅ unrar ready: {UNRAR_BIN}")
 else:
-    # Try to find system unrar as fallback
-    system_unrar = shutil.which("unrar")
-    if system_unrar:
-        rarfile.UNRAR_TOOL = system_unrar
-        logger.info(f"rarfile using system unrar: {system_unrar}")
-    else:
-        logger.warning("No unrar found – RAR extraction will likely fail")
-
-# Configure patoolib for RAR creation (if we have rar binary)
-def configure_patoolib_rar():
-    if RAR_BIN and os.path.exists(RAR_BIN):
-        from patoolib import programs
-        # Override rar program settings
-        programs.Programs['rar'] = programs.Program(
-            name='rar',
-            archive_cmd=[RAR_BIN, 'a', '-r', '-ep1'],
-            extract_cmd=[UNRAR_BIN or 'unrar', 'x', '-o+'],
-            test_cmd=[RAR_BIN, 't'],
-            list_cmd=[RAR_BIN, 'l'],
-            description="RAR archive using custom rar binary"
-        )
-        logger.info("patoolib configured to use custom rar binary")
-    else:
-        logger.warning("RAR creation not available (no rar binary)")
-
-configure_patoolib_rar()
+    logger.warning("❌ unrar not available – RAR extraction will fail")
+if RAR_BIN:
+    logger.info(f"✅ rar ready: {RAR_BIN}")
+else:
+    logger.warning("❌ rar not available – RAR creation disabled")
 
 def is_rar_writer_available() -> bool:
     return RAR_BIN is not None and os.path.exists(RAR_BIN)
@@ -181,8 +135,47 @@ def get_archive_type(file_path: str) -> Optional[str]:
         return "7z"
     return None
 
+# ================= DIRECT RAR EXTRACTION (NO LIBRARIES) =================
+def extract_rar_direct(archive_path: str, extract_dir: str) -> Tuple[bool, str]:
+    """Extract RAR using our unrar binary."""
+    if not UNRAR_BIN or not os.path.exists(UNRAR_BIN):
+        return False, "unrar binary not found. Cannot extract RAR."
+    
+    # unrar x -o+ archive.rar extract_dir/
+    cmd = [UNRAR_BIN, "x", "-o+", archive_path, extract_dir]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            return True, ""
+        else:
+            # Sometimes unrar returns non-zero even if extraction succeeded partially
+            # Check if output contains "All OK" or files actually extracted
+            if "All OK" in result.stderr or "All OK" in result.stdout:
+                return True, ""
+            return False, f"unrar error (code {result.returncode}): {result.stderr[:200]}"
+    except subprocess.TimeoutExpired:
+        return False, "RAR extraction timed out (file too large or corrupted)"
+    except Exception as e:
+        return False, f"Failed to run unrar: {str(e)}"
+
+def create_rar_direct(source_dir: str, output_path: str) -> Tuple[bool, str]:
+    """Create RAR archive using our rar binary."""
+    if not RAR_BIN or not os.path.exists(RAR_BIN):
+        return False, "rar binary not found. Cannot create RAR."
+    
+    # rar a -r -ep1 output.rar source_dir/
+    cmd = [RAR_BIN, "a", "-r", "-ep1", output_path, source_dir]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0:
+            return True, ""
+        else:
+            return False, f"rar error (code {result.returncode}): {result.stderr[:200]}"
+    except Exception as e:
+        return False, f"Failed to run rar: {str(e)}"
+
+# ================= ROBUST EXTRACTOR (handles all formats) =================
 def extract_archive_robust(archive_path: str, extract_dir: str, archive_type: str) -> Tuple[bool, str]:
-    """Extract using best method. For RAR, uses rarfile (with our UNRAR_TOOL)."""
     try:
         if archive_type == "zip":
             with zipfile.ZipFile(archive_path, "r") as zf:
@@ -193,27 +186,10 @@ def extract_archive_robust(archive_path: str, extract_dir: str, archive_type: st
                 szf.extractall(extract_dir)
             return True, ""
         elif archive_type == "rar":
-            # Force rarfile to use our binary
-            with rarfile.RarFile(archive_path, "r") as rf:
-                rf.extractall(extract_dir)
-            return True, ""
+            return extract_rar_direct(archive_path, extract_dir)
         else:
             return False, f"Unsupported archive type: {archive_type}"
-    except rarfile.RarCannotExec as e:
-        # Fallback to patoolib (might work if other tools exist)
-        try:
-            patoolib.extract_archive(archive_path, outdir=extract_dir)
-            return True, ""
-        except Exception as e2:
-            return False, f"RAR extraction failed: {str(e2)}"
     except Exception as e:
-        # If error mentions missing tool, try patoolib as last resort
-        if "could not find an executable program" in str(e):
-            try:
-                patoolib.extract_archive(archive_path, outdir=extract_dir)
-                return True, ""
-            except Exception as e2:
-                return False, f"RAR extraction failed: no suitable tool (tried rarfile and patoolib). {str(e2)}"
         return False, f"Extraction failed: {str(e)}"
 
 async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, percent: int):
@@ -276,6 +252,7 @@ async def convert_archive(
         await send_progress(chat_id, progress_msg_id, context, 30)
         total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
         processed = 0
+        
         if target_type == "zip":
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(temp_extract):
@@ -293,12 +270,14 @@ async def convert_archive(
             await send_progress(chat_id, progress_msg_id, context, 90)
         elif target_type == "rar":
             if not is_rar_writer_available():
-                return False, "RAR command not available – cannot create RAR archive (use ZIP or 7z)."
-            # Use patoolib (configured with our rar binary)
-            patoolib.create_archive(output_path, [temp_extract])
+                return False, "RAR creation not available (binary missing). Use ZIP or 7z."
+            success, err = create_rar_direct(temp_extract, output_path)
+            if not success:
+                return False, f"RAR creation failed: {err}"
             await send_progress(chat_id, progress_msg_id, context, 90)
         else:
             return False, f"Unsupported target type: {target_type}"
+        
         await send_progress(chat_id, progress_msg_id, context, 100)
         return True, ""
     except Exception as e:
@@ -368,6 +347,7 @@ async def clean_branding_in_archive(
             join_file = os.path.join(temp_extract, "JOIN_CHANNEL.txt")
             with open(join_file, "w", encoding="utf-8") as f:
                 f.write(CHANNEL_LINK)
+        # Repack using the same archive type
         if archive_type == "zip":
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(temp_extract):
@@ -380,8 +360,10 @@ async def clean_branding_in_archive(
                 szf.writeall(temp_extract, arcname="")
         elif archive_type == "rar":
             if not is_rar_writer_available():
-                return False, "RAR creation not available – cannot repack cleaned archive as RAR (use ZIP or 7z)."
-            patoolib.create_archive(output_path, [temp_extract])
+                return False, "RAR creation not available – cannot repack cleaned archive as RAR. Use ZIP or 7z."
+            success, err = create_rar_direct(temp_extract, output_path)
+            if not success:
+                return False, f"Repacking as RAR failed: {err}"
         else:
             return False, f"Unsupported archive type: {archive_type}"
         await send_progress(chat_id, progress_msg_id, context, 100)
@@ -392,16 +374,17 @@ async def clean_branding_in_archive(
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
-# ------------------ TELEGRAM HANDLERS (same as before) ------------------
+# ------------------ TELEGRAM HANDLERS (unchanged except for status message) ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rar_status = "✅ Full RAR support (extract + create)" if (UNRAR_BIN and RAR_BIN) else "⚠️ RAR extraction only (creation disabled)"
     msg = await update.message.reply_text(
-        "📦 **Archive Extractor & Converter Bot**\n\n"
-        "**What I can do:**\n"
-        "• Send me a `.zip`, `.rar` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
-        "• Send me a `.txt` file containing cookies (one per line) → I'll ask if you want to split each cookie into a separate `.txt` file and send a ZIP.\n"
-        "• `/clean` – delete all messages in this chat (no trace left).\n\n"
-        "✨ **Now with FULL RAR support** (including RAR5). RAR creation also available if binaries installed.\n"
-        f"RAR creation: {'✅ Enabled' if is_rar_writer_available() else '❌ Disabled (can extract but not create)'}",
+        f"📦 **Archive Extractor & Converter Bot**\n\n"
+        f"**What I can do:**\n"
+        f"• Send me a `.zip`, `.rar` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
+        f"• Send me a `.txt` file containing cookies (one per line) → split into separate `.txt` files + ZIP.\n"
+        f"• `/clean` – delete all messages in this chat (no trace left).\n\n"
+        f"**RAR Status:** {rar_status}\n"
+        f"**Note:** RAR5 fully supported via direct binary calls.",
         parse_mode="Markdown",
     )
     await store_message(update.effective_chat.id, msg.message_id)
@@ -652,9 +635,15 @@ def main():
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot started.")
-    print(f"   RAR extraction: {'YES (unrar binary installed)' if UNRAR_BIN else 'NO – will try system'}")
-    print(f"   RAR creation: {'YES' if is_rar_writer_available() else 'NO'}")
+    print("✅ Bot started. RAR extraction via direct unrar binary.")
+    if UNRAR_BIN:
+        print(f"   unrar binary: {UNRAR_BIN}")
+    else:
+        print("   ⚠️ unrar missing – RAR extraction will fail")
+    if RAR_BIN:
+        print(f"   rar binary: {RAR_BIN} (creation enabled)")
+    else:
+        print("   ⚠️ rar missing – RAR creation disabled")
     app.run_polling()
 
 if __name__ == "__main__":
