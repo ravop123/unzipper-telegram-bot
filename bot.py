@@ -1,5 +1,4 @@
 import os
-import sys
 import re
 import asyncio
 import tempfile
@@ -27,7 +26,7 @@ PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
 CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
 
-# Only text extensions for branding cleaner
+# Text extensions for branding cleaner
 TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json",
                    ".xml", ".html", ".css", ".js", ".py", ".sh", ".bat"}
 
@@ -64,17 +63,24 @@ async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message {msg_id}: {e}")
     chat_messages[chat_id].clear()
 
-# ------------------ MERGE MULTIPLE TXT FILES ------------------
+# ------------------ MERGE MULTIPLE TXT FILES (with duplicate removal) ------------------
 def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str]:
-    """Merge several text files into one, adding a separator between them."""
+    """
+    Merge several text files into one, removing duplicate lines globally.
+    First occurrence of each line is kept.
+    """
     try:
+        seen = set()
+        unique_lines = []
+        for path in file_paths:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.rstrip('\n')
+                    if stripped not in seen:
+                        seen.add(stripped)
+                        unique_lines.append(stripped)
         with open(output_path, "w", encoding="utf-8") as out_f:
-            for idx, path in enumerate(file_paths):
-                with open(path, "r", encoding="utf-8", errors="ignore") as in_f:
-                    content = in_f.read()
-                out_f.write(content)
-                if idx != len(file_paths) - 1:
-                    out_f.write("\n\n" + "="*40 + "\n\n")  # separator
+            out_f.write("\n".join(unique_lines))
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -86,7 +92,6 @@ def get_archive_type(file_path: str) -> Optional[str]:
         return "zip"
     if ext == ".7z":
         return "7z"
-    # no RAR
     return None
 
 def extract_archive(archive_path: str, extract_dir: str, archive_type: str) -> Tuple[bool, str]:
@@ -255,7 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 **Archive & Text File Bot**\n\n"
         "**What I can do:**\n"
         "• Send me a `.zip` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
-        "• Send me **multiple `.txt` files** → I will automatically collect them and offer to merge into one file.\n"
+        "• Send me **multiple `.txt` files** → I will automatically collect them and offer to merge into one file (duplicates removed).\n"
         "• `/clean` – delete all messages in this chat (no trace left).\n\n"
         "**Note:** RAR support has been removed as requested.",
         parse_mode="Markdown",
@@ -313,6 +318,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"📄 **Text files collected: {total}**\n\n"
             f"{files_list}\n\n"
+            f"✨ *Duplicates will be removed automatically when merging.*\n\n"
             "What would you like to do?"
         )
         keyboard = [
@@ -393,7 +399,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ You need at least two text files to merge. Send more `.txt` files.")
             return
 
-        await query.edit_message_text(f"🔄 Merging {len(merge_files)} files...")
+        await query.edit_message_text(f"🔄 Merging {len(merge_files)} files (removing duplicates)...")
         # Create temp output file
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as out_tmp:
             out_path = out_tmp.name
@@ -428,8 +434,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files_list = "\n".join(f"• {name}" for name, _ in merge_files)
         text = f"📋 **Files in queue:**\n\n{files_list}"
         await query.edit_message_text(text, parse_mode="Markdown")
-        # Restore buttons after a few seconds? We'll just keep showing, but need to allow user to act again.
-        # Better: re-send the original menu after showing list.
+        # Restore buttons after a few seconds
         keyboard = [
             [InlineKeyboardButton("🔀 Merge All", callback_data="merge_now")],
             [InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files")],
@@ -440,7 +445,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 f"📄 **Text files collected: {len(merge_files)}**\n\n"
-                f"{files_list}\n\nWhat would you like to do?",
+                f"{files_list}\n\n"
+                f"✨ *Duplicates will be removed automatically when merging.*\n\n"
+                "What would you like to do?",
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
@@ -601,7 +608,7 @@ def main():
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot started. RAR support removed. Multi‑TXT merging enabled.")
+    print("✅ Bot started. RAR support removed. Multi‑TXT merging with duplicate removal enabled.")
     app.run_polling()
 
 if __name__ == "__main__":
