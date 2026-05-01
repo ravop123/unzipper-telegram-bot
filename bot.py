@@ -6,14 +6,9 @@ import tempfile
 import logging
 import shutil
 import zipfile
-import subprocess
-import urllib.request
-import tarfile
-import stat
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
-# Bypass patoolib and rarfile for RAR – we use direct subprocess
 import py7zr
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,15 +27,9 @@ PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
 CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
 
-# Binaries will be stored here (writable on Render)
-BIN_DIR = "/tmp/rar_bins"
-os.makedirs(BIN_DIR, exist_ok=True)
-
-# URLs for official RARLAB Linux x64 static binaries
-UNRAR_URL = "https://www.rarlab.com/rar/unrar-6.2.12.tar.gz"
-RAR_URL = "https://www.rarlab.com/rar/rarlinux-x64-6.2.12.tar.gz"
-
-TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json", ".xml", ".html", ".css", ".js", ".py", ".sh", ".bat"}
+# Only text extensions for branding cleaner
+TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json",
+                   ".xml", ".html", ".css", ".js", ".py", ".sh", ".bat"}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,6 +46,7 @@ def home():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
+# Cleanup helpers for messages
 chat_messages: Dict[int, List[int]] = {}
 
 async def store_message(chat_id: int, message_id: int) -> None:
@@ -74,121 +64,42 @@ async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message {msg_id}: {e}")
     chat_messages[chat_id].clear()
 
-# ------------------ DIRECT RAR BINARY DOWNLOADER ------------------
-UNRAR_BIN = None
-RAR_BIN = None
-
-def download_and_extract_binary(url: str, binary_name: str) -> Optional[str]:
-    """Download tar.gz, extract, return absolute path to the binary."""
+# ------------------ MERGE MULTIPLE TXT FILES ------------------
+def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str]:
+    """Merge several text files into one, adding a separator between them."""
     try:
-        archive_path = os.path.join(BIN_DIR, os.path.basename(url))
-        if not os.path.exists(archive_path):
-            logger.info(f"Downloading {url} ...")
-            urllib.request.urlretrieve(url, archive_path)
-        
-        # Extract
-        with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(BIN_DIR)
-        
-        # Find the binary (usually in a subfolder)
-        extracted_dir = os.path.join(BIN_DIR, os.path.splitext(os.path.basename(url))[0].replace(".tar", ""))
-        if os.path.exists(extracted_dir):
-            candidate = os.path.join(extracted_dir, binary_name)
-            if os.path.exists(candidate):
-                os.chmod(candidate, os.stat(candidate).st_mode | stat.S_IEXEC)
-                return candidate
-        
-        # Fallback: search recursively
-        for root, _, files in os.walk(BIN_DIR):
-            if binary_name in files:
-                full_path = os.path.join(root, binary_name)
-                os.chmod(full_path, os.stat(full_path).st_mode | stat.S_IEXEC)
-                return full_path
-        return None
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            for idx, path in enumerate(file_paths):
+                with open(path, "r", encoding="utf-8", errors="ignore") as in_f:
+                    content = in_f.read()
+                out_f.write(content)
+                if idx != len(file_paths) - 1:
+                    out_f.write("\n\n" + "="*40 + "\n\n")  # separator
+        return True, ""
     except Exception as e:
-        logger.error(f"Failed to setup {binary_name}: {e}")
-        return None
+        return False, str(e)
 
-# Force download binaries at startup
-UNRAR_BIN = download_and_extract_binary(UNRAR_URL, "unrar")
-RAR_BIN = download_and_extract_binary(RAR_URL, "rar")
-
-if UNRAR_BIN:
-    logger.info(f"✅ unrar ready: {UNRAR_BIN}")
-else:
-    logger.warning("❌ unrar not available – RAR extraction will fail")
-if RAR_BIN:
-    logger.info(f"✅ rar ready: {RAR_BIN}")
-else:
-    logger.warning("❌ rar not available – RAR creation disabled")
-
-def is_rar_writer_available() -> bool:
-    return RAR_BIN is not None and os.path.exists(RAR_BIN)
-
+# ------------------ ARCHIVE HELPERS (ZIP & 7z only) ------------------
 def get_archive_type(file_path: str) -> Optional[str]:
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".zip":
         return "zip"
-    if ext == ".rar":
-        return "rar"
     if ext == ".7z":
         return "7z"
+    # no RAR
     return None
 
-# ================= DIRECT RAR EXTRACTION (NO LIBRARIES) =================
-def extract_rar_direct(archive_path: str, extract_dir: str) -> Tuple[bool, str]:
-    """Extract RAR using our unrar binary."""
-    if not UNRAR_BIN or not os.path.exists(UNRAR_BIN):
-        return False, "unrar binary not found. Cannot extract RAR."
-    
-    # unrar x -o+ archive.rar extract_dir/
-    cmd = [UNRAR_BIN, "x", "-o+", archive_path, extract_dir]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return True, ""
-        else:
-            # Sometimes unrar returns non-zero even if extraction succeeded partially
-            # Check if output contains "All OK" or files actually extracted
-            if "All OK" in result.stderr or "All OK" in result.stdout:
-                return True, ""
-            return False, f"unrar error (code {result.returncode}): {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return False, "RAR extraction timed out (file too large or corrupted)"
-    except Exception as e:
-        return False, f"Failed to run unrar: {str(e)}"
-
-def create_rar_direct(source_dir: str, output_path: str) -> Tuple[bool, str]:
-    """Create RAR archive using our rar binary."""
-    if not RAR_BIN or not os.path.exists(RAR_BIN):
-        return False, "rar binary not found. Cannot create RAR."
-    
-    # rar a -r -ep1 output.rar source_dir/
-    cmd = [RAR_BIN, "a", "-r", "-ep1", output_path, source_dir]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
-            return True, ""
-        else:
-            return False, f"rar error (code {result.returncode}): {result.stderr[:200]}"
-    except Exception as e:
-        return False, f"Failed to run rar: {str(e)}"
-
-# ================= ROBUST EXTRACTOR (handles all formats) =================
-def extract_archive_robust(archive_path: str, extract_dir: str, archive_type: str) -> Tuple[bool, str]:
+def extract_archive(archive_path: str, extract_dir: str, archive_type: str) -> Tuple[bool, str]:
     try:
         if archive_type == "zip":
             with zipfile.ZipFile(archive_path, "r") as zf:
                 zf.extractall(extract_dir)
-            return True, ""
         elif archive_type == "7z":
             with py7zr.SevenZipFile(archive_path, "r") as szf:
                 szf.extractall(extract_dir)
-            return True, ""
-        elif archive_type == "rar":
-            return extract_rar_direct(archive_path, extract_dir)
         else:
             return False, f"Unsupported archive type: {archive_type}"
+        return True, ""
     except Exception as e:
         return False, f"Extraction failed: {str(e)}"
 
@@ -204,35 +115,6 @@ async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEF
     except Exception:
         pass
 
-async def process_cookie_txt(txt_path: str, output_zip_path: str) -> Tuple[bool, str]:
-    try:
-        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [line.strip() for line in f if line.strip()]
-        if not lines:
-            return False, "File is empty"
-        seen = set()
-        unique_lines = []
-        for line in lines:
-            if line not in seen:
-                seen.add(line)
-                unique_lines.append(line)
-        temp_dir = tempfile.mkdtemp()
-        for idx, cookie in enumerate(unique_lines, start=1):
-            cookie_file = os.path.join(temp_dir, f"cookie_{idx}.txt")
-            with open(cookie_file, "w", encoding="utf-8") as cf:
-                cf.write(cookie)
-        with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(temp_dir):
-                for f in files:
-                    full_path = os.path.join(root, f)
-                    arcname = os.path.relpath(full_path, temp_dir)
-                    zf.write(full_path, arcname)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return True, ""
-    except Exception as e:
-        logger.exception("Cookie splitting failed")
-        return False, str(e)
-
 async def convert_archive(
     input_path: str,
     output_path: str,
@@ -245,14 +127,15 @@ async def convert_archive(
     try:
         input_type = get_archive_type(input_path)
         if not input_type:
-            return False, "Unknown input archive format"
-        success, err = extract_archive_robust(input_path, temp_extract, input_type)
+            return False, "Unknown input archive format (only ZIP/7z supported)"
+        success, err = extract_archive(input_path, temp_extract, input_type)
         if not success:
             return False, f"Extraction failed: {err}"
         await send_progress(chat_id, progress_msg_id, context, 30)
+
         total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
         processed = 0
-        
+
         if target_type == "zip":
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, files in os.walk(temp_extract):
@@ -268,16 +151,9 @@ async def convert_archive(
             with py7zr.SevenZipFile(output_path, "w") as szf:
                 szf.writeall(temp_extract, arcname="")
             await send_progress(chat_id, progress_msg_id, context, 90)
-        elif target_type == "rar":
-            if not is_rar_writer_available():
-                return False, "RAR creation not available (binary missing). Use ZIP or 7z."
-            success, err = create_rar_direct(temp_extract, output_path)
-            if not success:
-                return False, f"RAR creation failed: {err}"
-            await send_progress(chat_id, progress_msg_id, context, 90)
         else:
-            return False, f"Unsupported target type: {target_type}"
-        
+            return False, f"Unsupported target type: {target_type} (RAR removed)"
+
         await send_progress(chat_id, progress_msg_id, context, 100)
         return True, ""
     except Exception as e:
@@ -302,16 +178,18 @@ async def clean_branding_in_archive(
     compiled = [re.compile(p, re.IGNORECASE) for p in skip_patterns]
     archive_type = get_archive_type(input_path)
     if not archive_type:
-        return False, "Unknown archive format"
+        return False, "Unknown archive format (only ZIP/7z supported)"
     temp_extract = tempfile.mkdtemp()
     try:
-        success, err = extract_archive_robust(input_path, temp_extract, archive_type)
+        success, err = extract_archive(input_path, temp_extract, archive_type)
         if not success:
             return False, f"Extraction failed: {err}"
         await send_progress(chat_id, progress_msg_id, context, 30)
+
         total_files = sum(1 for root, _, files in os.walk(temp_extract) for f in files)
         processed = 0
         modified_any = False
+
         for root, _, files in os.walk(temp_extract):
             for file in files:
                 file_path = os.path.join(root, file)
@@ -343,10 +221,12 @@ async def clean_branding_in_archive(
                 if total_files > 0:
                     percent = 30 + int(40 * processed / total_files)
                     await send_progress(chat_id, progress_msg_id, context, min(percent, 70))
+
         if not modified_any:
             join_file = os.path.join(temp_extract, "JOIN_CHANNEL.txt")
             with open(join_file, "w", encoding="utf-8") as f:
                 f.write(CHANNEL_LINK)
+
         # Repack using the same archive type
         if archive_type == "zip":
             with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -358,14 +238,9 @@ async def clean_branding_in_archive(
         elif archive_type == "7z":
             with py7zr.SevenZipFile(output_path, "w") as szf:
                 szf.writeall(temp_extract, arcname="")
-        elif archive_type == "rar":
-            if not is_rar_writer_available():
-                return False, "RAR creation not available – cannot repack cleaned archive as RAR. Use ZIP or 7z."
-            success, err = create_rar_direct(temp_extract, output_path)
-            if not success:
-                return False, f"Repacking as RAR failed: {err}"
         else:
-            return False, f"Unsupported archive type: {archive_type}"
+            return False, f"Unsupported archive type for repacking: {archive_type}"
+
         await send_progress(chat_id, progress_msg_id, context, 100)
         return True, ""
     except Exception as e:
@@ -374,17 +249,15 @@ async def clean_branding_in_archive(
     finally:
         shutil.rmtree(temp_extract, ignore_errors=True)
 
-# ------------------ TELEGRAM HANDLERS (unchanged except for status message) ------------------
+# ------------------ TELEGRAM HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rar_status = "✅ Full RAR support (extract + create)" if (UNRAR_BIN and RAR_BIN) else "⚠️ RAR extraction only (creation disabled)"
     msg = await update.message.reply_text(
-        f"📦 **Archive Extractor & Converter Bot**\n\n"
-        f"**What I can do:**\n"
-        f"• Send me a `.zip`, `.rar` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
-        f"• Send me a `.txt` file containing cookies (one per line) → split into separate `.txt` files + ZIP.\n"
-        f"• `/clean` – delete all messages in this chat (no trace left).\n\n"
-        f"**RAR Status:** {rar_status}\n"
-        f"**Note:** RAR5 fully supported via direct binary calls.",
+        "📦 **Archive & Text File Bot**\n\n"
+        "**What I can do:**\n"
+        "• Send me a `.zip` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
+        "• Send me **multiple `.txt` files** → I will automatically collect them and offer to merge into one file.\n"
+        "• `/clean` – delete all messages in this chat (no trace left).\n\n"
+        "**Note:** RAR support has been removed as requested.",
         parse_mode="Markdown",
     )
     await store_message(update.effective_chat.id, msg.message_id)
@@ -406,44 +279,92 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = user_msg.chat_id
     document = user_msg.document
     await store_message(chat_id, user_msg.message_id)
+
     if not document:
         return
+
     filename = document.file_name.lower()
     file_ext = os.path.splitext(filename)[1]
+
+    # ------------------ TXT FILE HANDLING (MERGE MODE) ------------------
     if file_ext == ".txt":
         if document.file_size > MAX_FILE_SIZE:
             error_msg = await user_msg.reply_text("❌ File too large (max 50MB)")
             await store_message(chat_id, error_msg.message_id)
             return
+
+        # Download this text file
         file = await context.bot.get_file(document.file_id)
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             await file.download_to_drive(tmp.name)
-            txt_path = tmp.name
-        context.user_data["cookie_txt_path"] = txt_path
-        keyboard = [[
-            InlineKeyboardButton("✅ Split Cookies", callback_data="split_cookies"),
-            InlineKeyboardButton("❌ Ignore", callback_data="ignore_cookie"),
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        prompt_msg = await user_msg.reply_text(
-            "📄 **Cookie file received.**\nDo you want to split each cookie into a separate .txt file and receive a ZIP?",
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
+            tmp_path = tmp.name
+
+        # Initialize merge session if not exists
+        if "merge_files" not in context.user_data:
+            context.user_data["merge_files"] = []  # list of (original_name, file_path)
+            context.user_data["merge_msg_id"] = None
+
+        # Add current file
+        context.user_data["merge_files"].append((document.file_name, tmp_path))
+
+        # Build message with list of files and buttons
+        files_list = "\n".join(f"• {name}" for name, _ in context.user_data["merge_files"])
+        total = len(context.user_data["merge_files"])
+        text = (
+            f"📄 **Text files collected: {total}**\n\n"
+            f"{files_list}\n\n"
+            "What would you like to do?"
         )
-        await store_message(chat_id, prompt_msg.message_id)
+        keyboard = [
+            [InlineKeyboardButton("🔀 Merge All", callback_data="merge_now")],
+            [InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Edit previous merge prompt if exists, otherwise send new
+        if context.user_data["merge_msg_id"]:
+            try:
+                await context.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=context.user_data["merge_msg_id"],
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                new_msg = await user_msg.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+                context.user_data["merge_msg_id"] = new_msg.message_id
+                await store_message(chat_id, new_msg.message_id)
+        else:
+            new_msg = await user_msg.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+            context.user_data["merge_msg_id"] = new_msg.message_id
+            await store_message(chat_id, new_msg.message_id)
+
+        # Delete the "document received" message to keep chat clean
+        try:
+            await user_msg.delete()
+        except:
+            pass
         return
-    if not (filename.endswith(".zip") or filename.endswith(".rar") or filename.endswith(".7z")):
+
+    # ------------------ ARCHIVE HANDLING (ZIP / 7z) ------------------
+    if not (filename.endswith(".zip") or filename.endswith(".7z")):
         return
+
     if document.file_size > MAX_FILE_SIZE:
         error_msg = await user_msg.reply_text("❌ Archive too large (max 50MB)")
         await store_message(chat_id, error_msg.message_id)
         return
+
     file = await context.bot.get_file(document.file_id)
     with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp:
         await file.download_to_drive(tmp.name)
         tmp_path = tmp.name
+
     context.user_data["current_archive"] = tmp_path
     context.user_data["original_archive_name"] = document.file_name
+
     keyboard = [
         [
             InlineKeyboardButton("🔄 Convert", callback_data="convert"),
@@ -458,170 +379,215 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await store_message(chat_id, prompt_msg.message_id)
 
+# ------------------ CALLBACK HANDLER ------------------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
     action = query.data
-    if action == "split_cookies":
-        txt_path = context.user_data.get("cookie_txt_path")
-        if not txt_path or not os.path.exists(txt_path):
-            await query.edit_message_text("❌ Cookie file not found. Please send again.")
+
+    # ------------------ MERGE TXT FILES ACTIONS ------------------
+    if action == "merge_now":
+        merge_files = context.user_data.get("merge_files", [])
+        if len(merge_files) < 2:
+            await query.edit_message_text("❌ You need at least two text files to merge. Send more `.txt` files.")
             return
-        await query.edit_message_text("🔄 Splitting cookies into separate files...")
-        progress_msg = await query.message.reply_text("Processing...")
-        await store_message(chat_id, progress_msg.message_id)
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as zip_tmp:
-            zip_path = zip_tmp.name
-        success, error = await process_cookie_txt(txt_path, zip_path)
+
+        await query.edit_message_text(f"🔄 Merging {len(merge_files)} files...")
+        # Create temp output file
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as out_tmp:
+            out_path = out_tmp.name
+        file_paths = [path for _, path in merge_files]
+        success, err = merge_text_files(file_paths, out_path)
         if success:
-            with open(zip_path, "rb") as fp:
+            with open(out_path, "rb") as fp:
                 bio = BytesIO(fp.read())
-                bio.name = "cookies_split.zip"
-            result_msg = await query.message.reply_document(document=bio, filename="cookies_split.zip")
+                bio.name = "merged_texts.txt"
+            result_msg = await query.message.reply_document(document=bio, filename="merged_texts.txt")
             await store_message(chat_id, result_msg.message_id)
-            await progress_msg.delete()
-            os.unlink(txt_path)
-            os.unlink(zip_path)
-            context.user_data.pop("cookie_txt_path", None)
+            # Cleanup temp files
+            for _, path in merge_files:
+                os.unlink(path)
+            os.unlink(out_path)
+            context.user_data.pop("merge_files", None)
+            if context.user_data.get("merge_msg_id"):
+                try:
+                    await context.bot.delete_message(chat_id, context.user_data["merge_msg_id"])
+                except:
+                    pass
+                context.user_data.pop("merge_msg_id", None)
             await query.message.delete()
         else:
-            await progress_msg.edit_text(f"❌ Failed: {error}")
-            os.unlink(txt_path)
-            context.user_data.pop("cookie_txt_path", None)
-        return
-    elif action == "ignore_cookie":
-        txt_path = context.user_data.get("cookie_txt_path")
-        if txt_path and os.path.exists(txt_path):
-            os.unlink(txt_path)
-        context.user_data.pop("cookie_txt_path", None)
-        await query.edit_message_text("❌ Cookie processing cancelled.")
+            await query.edit_message_text(f"❌ Merge failed: {err}")
+
+    elif action == "show_merge_files":
+        merge_files = context.user_data.get("merge_files", [])
+        if not merge_files:
+            await query.answer("No files collected yet.")
+            return
+        files_list = "\n".join(f"• {name}" for name, _ in merge_files)
+        text = f"📋 **Files in queue:**\n\n{files_list}"
+        await query.edit_message_text(text, parse_mode="Markdown")
+        # Restore buttons after a few seconds? We'll just keep showing, but need to allow user to act again.
+        # Better: re-send the original menu after showing list.
+        keyboard = [
+            [InlineKeyboardButton("🔀 Merge All", callback_data="merge_now")],
+            [InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await asyncio.sleep(5)
+        try:
+            await query.edit_message_text(
+                f"📄 **Text files collected: {len(merge_files)}**\n\n"
+                f"{files_list}\n\nWhat would you like to do?",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+    elif action == "cancel_merge":
+        merge_files = context.user_data.pop("merge_files", [])
+        for _, path in merge_files:
+            os.unlink(path)
+        if context.user_data.get("merge_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id, context.user_data["merge_msg_id"])
+            except:
+                pass
+            context.user_data.pop("merge_msg_id", None)
+        await query.edit_message_text("❌ Merge cancelled. All temporary files deleted.")
         await asyncio.sleep(2)
         try:
             await query.message.delete()
         except:
             pass
-        return
-    archive_path = context.user_data.get("current_archive")
-    original_name = context.user_data.get("original_archive_name", "archive")
-    if not archive_path or not os.path.exists(archive_path):
-        await query.edit_message_text("❌ Archive not found. Please send the file again.")
-        return
-    if action == "unzip":
-        await query.edit_message_text("📂 Extracting and sending files...")
-        extract_dir = tempfile.mkdtemp()
-        try:
-            archive_type = get_archive_type(archive_path)
-            success, err = extract_archive_robust(archive_path, extract_dir, archive_type)
-            if not success:
-                await query.message.reply_text(f"❌ Extraction failed: {err}")
-                return
-            sent_count = 0
-            for root, _, files in os.walk(extract_dir):
-                for f in files:
-                    file_path = os.path.join(root, f)
-                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                        continue
-                    with open(file_path, "rb") as fp:
-                        bio = BytesIO(fp.read())
-                        bio.name = f
-                    sent_msg = await query.message.reply_document(document=bio, filename=f)
-                    await store_message(chat_id, sent_msg.message_id)
-                    sent_count += 1
-                    await asyncio.sleep(0.3)
-            if sent_count == 0:
-                warn = await query.message.reply_text("⚠️ No valid files found (empty or >50MB).")
-                await store_message(chat_id, warn.message_id)
-        except Exception as e:
-            await query.message.reply_text(f"❌ Extraction failed: {str(e)}")
-        finally:
-            shutil.rmtree(extract_dir, ignore_errors=True)
-            os.unlink(archive_path)
-            context.user_data.pop("current_archive", None)
-            await query.message.delete()
-    elif action == "convert":
-        buttons = [
-            InlineKeyboardButton("📦 ZIP", callback_data="conv_zip"),
-            InlineKeyboardButton("📀 7Z", callback_data="conv_7z"),
-        ]
-        if is_rar_writer_available():
-            buttons.insert(1, InlineKeyboardButton("🗜️ RAR", callback_data="conv_rar"))
-        buttons_row = [buttons]
-        buttons_row.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")])
-        reply_markup = InlineKeyboardMarkup(buttons_row)
-        await query.edit_message_text(
-            "🔄 **Select target format:**",
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
-    elif action.startswith("conv_"):
-        target = action.split("_")[1]
-        if target == "rar" and not is_rar_writer_available():
+
+    # ------------------ ARCHIVE ACTIONS (unchanged, but RAR removed) ------------------
+    elif action in ("convert", "unzip", "cleaner", "back_to_menu", "conv_zip", "conv_7z"):
+        archive_path = context.user_data.get("current_archive")
+        original_name = context.user_data.get("original_archive_name", "archive")
+        if not archive_path or not os.path.exists(archive_path):
+            await query.edit_message_text("❌ Archive not found. Please send the file again.")
+            return
+
+        if action == "unzip":
+            await query.edit_message_text("📂 Extracting and sending files...")
+            extract_dir = tempfile.mkdtemp()
+            try:
+                archive_type = get_archive_type(archive_path)
+                if not archive_type:
+                    await query.message.reply_text("❌ Unsupported archive type (only ZIP/7z).")
+                    return
+                success, err = extract_archive(archive_path, extract_dir, archive_type)
+                if not success:
+                    await query.message.reply_text(f"❌ Extraction failed: {err}")
+                    return
+                sent_count = 0
+                for root, _, files in os.walk(extract_dir):
+                    for f in files:
+                        file_path = os.path.join(root, f)
+                        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                            continue
+                        with open(file_path, "rb") as fp:
+                            bio = BytesIO(fp.read())
+                            bio.name = f
+                        sent_msg = await query.message.reply_document(document=bio, filename=f)
+                        await store_message(chat_id, sent_msg.message_id)
+                        sent_count += 1
+                        await asyncio.sleep(0.3)
+                if sent_count == 0:
+                    warn = await query.message.reply_text("⚠️ No valid files found (empty or >50MB).")
+                    await store_message(chat_id, warn.message_id)
+            except Exception as e:
+                await query.message.reply_text(f"❌ Extraction failed: {str(e)}")
+            finally:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                os.unlink(archive_path)
+                context.user_data.pop("current_archive", None)
+                await query.message.delete()
+
+        elif action == "convert":
+            buttons = [
+                [InlineKeyboardButton("📦 ZIP", callback_data="conv_zip")],
+                [InlineKeyboardButton("📀 7Z", callback_data="conv_7z")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(buttons)
             await query.edit_message_text(
-                "❌ **RAR creation is not available – but RAR extraction works fine.**",
+                "🔄 **Select target format:**",
+                reply_markup=reply_markup,
                 parse_mode="Markdown",
             )
-            return
-        await query.edit_message_text(f"🔄 Converting to **{target.upper()}**...")
-        progress_msg = await query.message.reply_text("Starting conversion...")
-        await store_message(chat_id, progress_msg.message_id)
-        output_ext = f".{target}"
-        with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
-            out_path = out_tmp.name
-        success, error_msg = await convert_archive(
-            archive_path, out_path, target,
-            progress_msg.message_id, chat_id, context
-        )
-        if success:
-            with open(out_path, "rb") as fp:
-                bio = BytesIO(fp.read())
-                new_name = f"{os.path.splitext(original_name)[0]}.{target}"
-                bio.name = new_name
-            result_msg = await query.message.reply_document(document=bio, filename=new_name)
-            await store_message(chat_id, result_msg.message_id)
-            await progress_msg.delete()
-            os.unlink(archive_path)
-            context.user_data.pop("current_archive", None)
-            await query.message.delete()
-        else:
-            await progress_msg.edit_text(f"❌ Conversion to {target.upper()} failed.\n{error_msg[:200]}")
-    elif action == "back_to_menu":
-        keyboard = [
-            [
-                InlineKeyboardButton("🔄 Convert", callback_data="convert"),
-                InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
-                InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
+
+        elif action.startswith("conv_"):
+            target = action.split("_")[1]
+            if target not in ("zip", "7z"):
+                await query.edit_message_text("❌ Only ZIP and 7z are supported (RAR removed).")
+                return
+            await query.edit_message_text(f"🔄 Converting to **{target.upper()}**...")
+            progress_msg = await query.message.reply_text("Starting conversion...")
+            await store_message(chat_id, progress_msg.message_id)
+            output_ext = f".{target}"
+            with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
+                out_path = out_tmp.name
+            success, error_msg = await convert_archive(
+                archive_path, out_path, target,
+                progress_msg.message_id, chat_id, context
+            )
+            if success:
+                with open(out_path, "rb") as fp:
+                    bio = BytesIO(fp.read())
+                    new_name = f"{os.path.splitext(original_name)[0]}.{target}"
+                    bio.name = new_name
+                result_msg = await query.message.reply_document(document=bio, filename=new_name)
+                await store_message(chat_id, result_msg.message_id)
+                await progress_msg.delete()
+                os.unlink(archive_path)
+                context.user_data.pop("current_archive", None)
+                await query.message.delete()
+            else:
+                await progress_msg.edit_text(f"❌ Conversion to {target.upper()} failed.\n{error_msg[:200]}")
+
+        elif action == "back_to_menu":
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Convert", callback_data="convert"),
+                    InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
+                    InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
+                ]
             ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "✅ Archive received. Choose an action:",
-            reply_markup=reply_markup,
-        )
-    elif action == "cleaner":
-        await query.edit_message_text("🧹 Cleaning branding from archive...")
-        progress_msg = await query.message.reply_text("Starting branding removal...")
-        await store_message(chat_id, progress_msg.message_id)
-        output_ext = os.path.splitext(archive_path)[1]
-        with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
-            out_path = out_tmp.name
-        success, error_msg = await clean_branding_in_archive(
-            archive_path, out_path,
-            progress_msg.message_id, chat_id, context
-        )
-        if success:
-            with open(out_path, "rb") as fp:
-                bio = BytesIO(fp.read())
-                cleaned_name = f"cleaned_{original_name}"
-                bio.name = cleaned_name
-            result_msg = await query.message.reply_document(document=bio, filename=cleaned_name)
-            await store_message(chat_id, result_msg.message_id)
-            await progress_msg.delete()
-            os.unlink(archive_path)
-            context.user_data.pop("current_archive", None)
-            await query.message.delete()
-        else:
-            await progress_msg.edit_text(f"❌ Branding cleaning failed.\n{error_msg[:200]}")
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "✅ Archive received. Choose an action:",
+                reply_markup=reply_markup,
+            )
+
+        elif action == "cleaner":
+            await query.edit_message_text("🧹 Cleaning branding from archive...")
+            progress_msg = await query.message.reply_text("Starting branding removal...")
+            await store_message(chat_id, progress_msg.message_id)
+            output_ext = os.path.splitext(archive_path)[1]
+            with tempfile.NamedTemporaryFile(suffix=output_ext, delete=False) as out_tmp:
+                out_path = out_tmp.name
+            success, error_msg = await clean_branding_in_archive(
+                archive_path, out_path,
+                progress_msg.message_id, chat_id, context
+            )
+            if success:
+                with open(out_path, "rb") as fp:
+                    bio = BytesIO(fp.read())
+                    cleaned_name = f"cleaned_{original_name}"
+                    bio.name = cleaned_name
+                result_msg = await query.message.reply_document(document=bio, filename=cleaned_name)
+                await store_message(chat_id, result_msg.message_id)
+                await progress_msg.delete()
+                os.unlink(archive_path)
+                context.user_data.pop("current_archive", None)
+                await query.message.delete()
+            else:
+                await progress_msg.edit_text(f"❌ Branding cleaning failed.\n{error_msg[:200]}")
 
 # ------------------ MAIN ------------------
 def main():
@@ -635,15 +601,7 @@ def main():
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot started. RAR extraction via direct unrar binary.")
-    if UNRAR_BIN:
-        print(f"   unrar binary: {UNRAR_BIN}")
-    else:
-        print("   ⚠️ unrar missing – RAR extraction will fail")
-    if RAR_BIN:
-        print(f"   rar binary: {RAR_BIN} (creation enabled)")
-    else:
-        print("   ⚠️ rar missing – RAR creation disabled")
+    print("✅ Bot started. RAR support removed. Multi‑TXT merging enabled.")
     app.run_polling()
 
 if __name__ == "__main__":
