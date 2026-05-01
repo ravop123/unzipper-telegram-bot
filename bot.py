@@ -25,6 +25,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
 CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
+SPLIT_LINES_PER_FILE = 2000  # Lines per split file (adjustable)
 
 # Text extensions for branding cleaner
 TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json",
@@ -67,7 +68,7 @@ async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYP
 def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str]:
     """
     Merge several text files into one, removing duplicate lines globally.
-    First occurrence of each line is kept.
+    Returns (success, error_message or empty string).
     """
     try:
         seen = set()
@@ -84,6 +85,29 @@ def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str
         return True, ""
     except Exception as e:
         return False, str(e)
+
+def get_unique_lines_from_files(file_paths: List[str]) -> Tuple[bool, List[str], str]:
+    """
+    Extract unique lines from multiple files.
+    Returns (success, list_of_unique_lines, error_message).
+    """
+    try:
+        seen = set()
+        unique_lines = []
+        for path in file_paths:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.rstrip('\n')
+                    if stripped not in seen:
+                        seen.add(stripped)
+                        unique_lines.append(stripped)
+        return True, unique_lines, ""
+    except Exception as e:
+        return False, [], str(e)
+
+def split_lines_into_chunks(lines: List[str], chunk_size: int) -> List[List[str]]:
+    """Split a list of lines into chunks of given size."""
+    return [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
 
 # ------------------ ARCHIVE HELPERS (ZIP & 7z only) ------------------
 def get_archive_type(file_path: str) -> Optional[str]:
@@ -261,6 +285,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**What I can do:**\n"
         "• Send me a `.zip` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
         "• Send me **multiple `.txt` files** → I will automatically collect them and offer to merge into one file (duplicates removed).\n"
+        "• **Merge All (Splitted)** – same duplicate removal, but splits output into chunks of 2000 lines each.\n"
         "• `/clean` – delete all messages in this chat (no trace left).\n\n"
         "**Note:** RAR support has been removed as requested.",
         parse_mode="Markdown",
@@ -322,9 +347,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "What would you like to do?"
         )
         keyboard = [
-            [InlineKeyboardButton("🔀 Merge All", callback_data="merge_now")],
-            [InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
+            [
+                InlineKeyboardButton("🔀 Merge All", callback_data="merge_now"),
+                InlineKeyboardButton("🔀 Merge All (Splitted)", callback_data="merge_split")
+            ],
+            [
+                InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")
+            ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -426,6 +456,62 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text(f"❌ Merge failed: {err}")
 
+    elif action == "merge_split":
+        merge_files = context.user_data.get("merge_files", [])
+        if len(merge_files) < 2:
+            await query.edit_message_text("❌ You need at least two text files to split-merge. Send more `.txt` files.")
+            return
+
+        await query.edit_message_text(f"🔄 Processing {len(merge_files)} files (removing duplicates & splitting into {SPLIT_LINES_PER_FILE}-line chunks)...")
+        file_paths = [path for _, path in merge_files]
+        success, unique_lines, err = get_unique_lines_from_files(file_paths)
+        if not success:
+            await query.edit_message_text(f"❌ Failed to read files: {err}")
+            return
+
+        total_unique = len(unique_lines)
+        if total_unique == 0:
+            await query.edit_message_text("❌ No unique lines found after merging.")
+            return
+
+        chunks = split_lines_into_chunks(unique_lines, SPLIT_LINES_PER_FILE)
+        num_chunks = len(chunks)
+        
+        # Send a status message
+        status_msg = await query.message.reply_text(f"📦 Splitting {total_unique} unique lines into {num_chunks} file(s)...")
+        
+        sent_files = 0
+        for idx, chunk in enumerate(chunks, start=1):
+            # Create temp file for this chunk
+            with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode='w', encoding='utf-8') as tmp:
+                tmp.write("\n".join(chunk))
+                chunk_path = tmp.name
+            # Send file
+            with open(chunk_path, "rb") as fp:
+                bio = BytesIO(fp.read())
+                if num_chunks == 1:
+                    bio.name = "merged_texts.txt"
+                else:
+                    bio.name = f"merged_part{idx}.txt"
+                result_msg = await query.message.reply_document(document=bio, filename=bio.name)
+                await store_message(chat_id, result_msg.message_id)
+            os.unlink(chunk_path)
+            sent_files += 1
+            await asyncio.sleep(0.5)  # avoid flooding
+        
+        # Cleanup original temp files
+        for _, path in merge_files:
+            os.unlink(path)
+        context.user_data.pop("merge_files", None)
+        if context.user_data.get("merge_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id, context.user_data["merge_msg_id"])
+            except:
+                pass
+            context.user_data.pop("merge_msg_id", None)
+        await status_msg.delete()
+        await query.message.delete()
+
     elif action == "show_merge_files":
         merge_files = context.user_data.get("merge_files", [])
         if not merge_files:
@@ -436,9 +522,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown")
         # Restore buttons after a few seconds
         keyboard = [
-            [InlineKeyboardButton("🔀 Merge All", callback_data="merge_now")],
-            [InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
+            [
+                InlineKeyboardButton("🔀 Merge All", callback_data="merge_now"),
+                InlineKeyboardButton("🔀 Merge All (Splitted)", callback_data="merge_split")
+            ],
+            [
+                InlineKeyboardButton("📋 Show Files", callback_data="show_merge_files"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")
+            ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await asyncio.sleep(5)
@@ -471,7 +562,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # ------------------ ARCHIVE ACTIONS (unchanged, but RAR removed) ------------------
+    # ------------------ ARCHIVE ACTIONS (unchanged) ------------------
     elif action in ("convert", "unzip", "cleaner", "back_to_menu", "conv_zip", "conv_7z"):
         archive_path = context.user_data.get("current_archive")
         original_name = context.user_data.get("original_archive_name", "archive")
@@ -608,7 +699,7 @@ def main():
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot started. RAR support removed. Multi‑TXT merging with duplicate removal enabled.")
+    print("✅ Bot started. RAR removed. Multi‑TXT merging with split option enabled.")
     app.run_polling()
 
 if __name__ == "__main__":
