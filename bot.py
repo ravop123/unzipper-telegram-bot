@@ -25,7 +25,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
 CHANNEL_LINK = "https://t.me/+QP2gNqcUbSRiYTk1"
-SPLIT_LINES_PER_FILE = 2000  # Lines per split file (adjustable)
+SPLIT_LINES_PER_FILE = 2000  # Lines per split file for text merge
 
 # Text extensions for branding cleaner
 TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".ini", ".conf", ".json",
@@ -64,12 +64,9 @@ async def delete_stored_messages(chat_id: int, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Could not delete message {msg_id}: {e}")
     chat_messages[chat_id].clear()
 
-# ------------------ MERGE MULTIPLE TXT FILES (with duplicate removal) ------------------
+# ------------------ TEXT FILE MERGE (with duplicate removal) ------------------
 def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str]:
-    """
-    Merge several text files into one, removing duplicate lines globally.
-    Returns (success, error_message or empty string).
-    """
+    """Merge several text files into one, removing duplicate lines globally."""
     try:
         seen = set()
         unique_lines = []
@@ -87,10 +84,7 @@ def merge_text_files(file_paths: List[str], output_path: str) -> Tuple[bool, str
         return False, str(e)
 
 def get_unique_lines_from_files(file_paths: List[str]) -> Tuple[bool, List[str], str]:
-    """
-    Extract unique lines from multiple files.
-    Returns (success, list_of_unique_lines, error_message).
-    """
+    """Extract unique lines from multiple files."""
     try:
         seen = set()
         unique_lines = []
@@ -109,7 +103,7 @@ def split_lines_into_chunks(lines: List[str], chunk_size: int) -> List[List[str]
     """Split a list of lines into chunks of given size."""
     return [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
 
-# ------------------ ARCHIVE HELPERS (ZIP & 7z only) ------------------
+# ------------------ ARCHIVE HELPERS (ZIP & 7z) ------------------
 def get_archive_type(file_path: str) -> Optional[str]:
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".zip":
@@ -131,6 +125,52 @@ def extract_archive(archive_path: str, extract_dir: str, archive_type: str) -> T
         return True, ""
     except Exception as e:
         return False, f"Extraction failed: {str(e)}"
+
+def create_archive(source_dir: str, output_path: str, archive_type: str) -> Tuple[bool, str]:
+    """Create ZIP or 7z archive from source directory."""
+    try:
+        if archive_type == "zip":
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(source_dir):
+                    for f in files:
+                        full_path = os.path.join(root, f)
+                        arcname = os.path.relpath(full_path, source_dir)
+                        zf.write(full_path, arcname)
+        elif archive_type == "7z":
+            with py7zr.SevenZipFile(output_path, "w") as szf:
+                szf.writeall(source_dir, arcname="")
+        else:
+            return False, f"Unsupported archive type: {archive_type}"
+        return True, ""
+    except Exception as e:
+        return False, f"Archive creation failed: {str(e)}"
+
+def merge_archives(archive_paths: List[Tuple[str, str]], output_path: str, target_type: str) -> Tuple[bool, str]:
+    """
+    Merge multiple archives into one.
+    Each archive is extracted into a subfolder named after the original file name (without extension).
+    Then everything is packed into target_type archive.
+    archive_paths: list of (original_filename, file_path)
+    """
+    temp_root = tempfile.mkdtemp()
+    try:
+        for orig_name, arch_path in archive_paths:
+            # Create subfolder named after original file (without extension)
+            base_name = os.path.splitext(orig_name)[0]
+            extract_dir = os.path.join(temp_root, base_name)
+            os.makedirs(extract_dir, exist_ok=True)
+            arch_type = get_archive_type(arch_path)
+            if not arch_type:
+                return False, f"Unknown archive type for {orig_name}"
+            success, err = extract_archive(arch_path, extract_dir, arch_type)
+            if not success:
+                return False, f"Failed to extract {orig_name}: {err}"
+        # Now pack temp_root into output archive
+        return create_archive(temp_root, output_path, target_type)
+    except Exception as e:
+        return False, str(e)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 async def send_progress(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, percent: int):
     bar_length = 20
@@ -181,7 +221,7 @@ async def convert_archive(
                 szf.writeall(temp_extract, arcname="")
             await send_progress(chat_id, progress_msg_id, context, 90)
         else:
-            return False, f"Unsupported target type: {target_type} (RAR removed)"
+            return False, f"Unsupported target type: {target_type}"
 
         await send_progress(chat_id, progress_msg_id, context, 100)
         return True, ""
@@ -283,11 +323,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         "📦 **Archive & Text File Bot**\n\n"
         "**What I can do:**\n"
-        "• Send me a `.zip` or `.7z` → choose Convert / Unzip / Branding Cleaner\n"
-        "• Send me **multiple `.txt` files** → I will automatically collect them and offer to merge into one file (duplicates removed).\n"
-        "• **Merge All (Splitted)** – same duplicate removal, but splits output into chunks of 2000 lines each.\n"
+        "• Send me **multiple `.txt` files** → merge into one or split into chunks (duplicates removed).\n"
+        "• Send me **multiple `.zip` or `.7z` files** → merge all into one archive, or process a single archive (convert / unzip / branding cleaner).\n"
         "• `/clean` – delete all messages in this chat (no trace left).\n\n"
-        "**Note:** RAR support has been removed as requested.",
+        "**Note:** RAR support has been removed.",
         parse_mode="Markdown",
     )
     await store_message(update.effective_chat.id, msg.message_id)
@@ -393,27 +432,61 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await store_message(chat_id, error_msg.message_id)
         return
 
+    # Download the archive
     file = await context.bot.get_file(document.file_id)
     with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp:
         await file.download_to_drive(tmp.name)
         tmp_path = tmp.name
 
-    context.user_data["current_archive"] = tmp_path
-    context.user_data["original_archive_name"] = document.file_name
+    # Initialize archive merge session if not exists
+    if "pending_archives" not in context.user_data:
+        context.user_data["pending_archives"] = []  # list of (original_name, file_path)
+        context.user_data["archive_prompt_msg_id"] = None
 
+    # Add current archive
+    context.user_data["pending_archives"].append((document.file_name, tmp_path))
+
+    # Build message showing list of collected archives
+    archive_list = "\n".join(f"• {name}" for name, _ in context.user_data["pending_archives"])
+    total_archives = len(context.user_data["pending_archives"])
+    text = (
+        f"📦 **Archives collected: {total_archives}**\n\n"
+        f"{archive_list}\n\n"
+        "What would you like to do?"
+    )
     keyboard = [
         [
-            InlineKeyboardButton("🔄 Convert", callback_data="convert"),
-            InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
-            InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
-        ]
+            InlineKeyboardButton("📂 Process Single Archive", callback_data="process_single_archive"),
+            InlineKeyboardButton("🔀 Merge All Archives", callback_data="merge_archives_choose_format")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_archive_merge")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    prompt_msg = await user_msg.reply_text(
-        "✅ Archive received. Choose an action:",
-        reply_markup=reply_markup,
-    )
-    await store_message(chat_id, prompt_msg.message_id)
+
+    # Edit previous prompt or send new
+    if context.user_data["archive_prompt_msg_id"]:
+        try:
+            await context.bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=context.user_data["archive_prompt_msg_id"],
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            new_msg = await user_msg.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+            context.user_data["archive_prompt_msg_id"] = new_msg.message_id
+            await store_message(chat_id, new_msg.message_id)
+    else:
+        new_msg = await user_msg.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        context.user_data["archive_prompt_msg_id"] = new_msg.message_id
+        await store_message(chat_id, new_msg.message_id)
+
+    # Delete the "document received" message
+    try:
+        await user_msg.delete()
+    except:
+        pass
 
 # ------------------ CALLBACK HANDLER ------------------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,7 +495,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     action = query.data
 
-    # ------------------ MERGE TXT FILES ACTIONS ------------------
+    # ------------------ TEXT MERGE ACTIONS ------------------
     if action == "merge_now":
         merge_files = context.user_data.get("merge_files", [])
         if len(merge_files) < 2:
@@ -430,7 +503,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.edit_message_text(f"🔄 Merging {len(merge_files)} files (removing duplicates)...")
-        # Create temp output file
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as out_tmp:
             out_path = out_tmp.name
         file_paths = [path for _, path in merge_files]
@@ -441,7 +513,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bio.name = "merged_texts.txt"
             result_msg = await query.message.reply_document(document=bio, filename="merged_texts.txt")
             await store_message(chat_id, result_msg.message_id)
-            # Cleanup temp files
+            # Cleanup
             for _, path in merge_files:
                 os.unlink(path)
             os.unlink(out_path)
@@ -476,17 +548,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chunks = split_lines_into_chunks(unique_lines, SPLIT_LINES_PER_FILE)
         num_chunks = len(chunks)
-        
-        # Send a status message
         status_msg = await query.message.reply_text(f"📦 Splitting {total_unique} unique lines into {num_chunks} file(s)...")
         
         sent_files = 0
         for idx, chunk in enumerate(chunks, start=1):
-            # Create temp file for this chunk
             with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode='w', encoding='utf-8') as tmp:
                 tmp.write("\n".join(chunk))
                 chunk_path = tmp.name
-            # Send file
             with open(chunk_path, "rb") as fp:
                 bio = BytesIO(fp.read())
                 if num_chunks == 1:
@@ -497,9 +565,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await store_message(chat_id, result_msg.message_id)
             os.unlink(chunk_path)
             sent_files += 1
-            await asyncio.sleep(0.5)  # avoid flooding
+            await asyncio.sleep(0.5)
         
-        # Cleanup original temp files
         for _, path in merge_files:
             os.unlink(path)
         context.user_data.pop("merge_files", None)
@@ -520,7 +587,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files_list = "\n".join(f"• {name}" for name, _ in merge_files)
         text = f"📋 **Files in queue:**\n\n{files_list}"
         await query.edit_message_text(text, parse_mode="Markdown")
-        # Restore buttons after a few seconds
         keyboard = [
             [
                 InlineKeyboardButton("🔀 Merge All", callback_data="merge_now"),
@@ -536,9 +602,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 f"📄 **Text files collected: {len(merge_files)}**\n\n"
-                f"{files_list}\n\n"
-                f"✨ *Duplicates will be removed automatically when merging.*\n\n"
-                "What would you like to do?",
+                f"{files_list}\n\n✨ *Duplicates will be removed automatically.*\n\nWhat would you like to do?",
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
@@ -562,7 +626,128 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # ------------------ ARCHIVE ACTIONS (unchanged) ------------------
+    # ------------------ ARCHIVE MERGE ACTIONS ------------------
+    elif action == "process_single_archive":
+        pending = context.user_data.get("pending_archives", [])
+        if not pending:
+            await query.edit_message_text("❌ No archive found.")
+            return
+        # Take the last archive as the one to process
+        orig_name, arch_path = pending[-1]
+        context.user_data["current_archive"] = arch_path
+        context.user_data["original_archive_name"] = orig_name
+        # Clear pending archives list and delete prompt
+        for _, p in pending:
+            if p != arch_path:  # keep only the one we use? Actually we should delete others
+                os.unlink(p)
+        context.user_data.pop("pending_archives", None)
+        if context.user_data.get("archive_prompt_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id, context.user_data["archive_prompt_msg_id"])
+            except:
+                pass
+            context.user_data.pop("archive_prompt_msg_id", None)
+        # Show conversion menu
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Convert", callback_data="convert"),
+                InlineKeyboardButton("📂 Unzip", callback_data="unzip"),
+                InlineKeyboardButton("🧹 Branding Cleaner", callback_data="cleaner"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "✅ Archive ready. Choose an action:",
+            reply_markup=reply_markup,
+        )
+
+    elif action == "merge_archives_choose_format":
+        pending = context.user_data.get("pending_archives", [])
+        if len(pending) < 2:
+            await query.edit_message_text("❌ You need at least two archives to merge. Send more ZIP/7z files.")
+            return
+        # Ask for target format
+        keyboard = [
+            [InlineKeyboardButton("📦 ZIP", callback_data="merge_archives_zip")],
+            [InlineKeyboardButton("📀 7Z", callback_data="merge_archives_7z")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_archive_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🗜️ **Choose output format for merged archive:**",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+
+    elif action.startswith("merge_archives_"):
+        target_format = action.split("_")[2]  # "zip" or "7z"
+        pending = context.user_data.get("pending_archives", [])
+        if len(pending) < 2:
+            await query.edit_message_text("❌ Not enough archives to merge.")
+            return
+        await query.edit_message_text(f"🔄 Merging {len(pending)} archives into one {target_format.upper()} file...")
+        progress_msg = await query.message.reply_text("Processing, please wait...")
+        with tempfile.NamedTemporaryFile(suffix=f".{target_format}", delete=False) as out_tmp:
+            out_path = out_tmp.name
+        success, err = merge_archives(pending, out_path, target_format)
+        if success:
+            with open(out_path, "rb") as fp:
+                bio = BytesIO(fp.read())
+                bio.name = f"merged_archives.{target_format}"
+            result_msg = await query.message.reply_document(document=bio, filename=bio.name)
+            await store_message(chat_id, result_msg.message_id)
+            await progress_msg.delete()
+            # Clean up all collected archives
+            for _, p in pending:
+                os.unlink(p)
+            context.user_data.pop("pending_archives", None)
+            if context.user_data.get("archive_prompt_msg_id"):
+                try:
+                    await context.bot.delete_message(chat_id, context.user_data["archive_prompt_msg_id"])
+                except:
+                    pass
+                context.user_data.pop("archive_prompt_msg_id", None)
+            await query.message.delete()
+        else:
+            await progress_msg.edit_text(f"❌ Merge failed: {err}")
+
+    elif action == "back_to_archive_menu":
+        pending = context.user_data.get("pending_archives", [])
+        archive_list = "\n".join(f"• {name}" for name, _ in pending)
+        total = len(pending)
+        text = (
+            f"📦 **Archives collected: {total}**\n\n"
+            f"{archive_list}\n\n"
+            "What would you like to do?"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("📂 Process Single Archive", callback_data="process_single_archive"),
+                InlineKeyboardButton("🔀 Merge All Archives", callback_data="merge_archives_choose_format")
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_archive_merge")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    elif action == "cancel_archive_merge":
+        pending = context.user_data.pop("pending_archives", [])
+        for _, p in pending:
+            os.unlink(p)
+        if context.user_data.get("archive_prompt_msg_id"):
+            try:
+                await context.bot.delete_message(chat_id, context.user_data["archive_prompt_msg_id"])
+            except:
+                pass
+            context.user_data.pop("archive_prompt_msg_id", None)
+        await query.edit_message_text("❌ Archive merge cancelled. All temporary files deleted.")
+        await asyncio.sleep(2)
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+    # ------------------ SINGLE ARCHIVE ACTIONS (convert, unzip, cleaner, back) ------------------
     elif action in ("convert", "unzip", "cleaner", "back_to_menu", "conv_zip", "conv_7z"):
         archive_path = context.user_data.get("current_archive")
         original_name = context.user_data.get("original_archive_name", "archive")
@@ -622,7 +807,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action.startswith("conv_"):
             target = action.split("_")[1]
             if target not in ("zip", "7z"):
-                await query.edit_message_text("❌ Only ZIP and 7z are supported (RAR removed).")
+                await query.edit_message_text("❌ Only ZIP and 7z are supported.")
                 return
             await query.edit_message_text(f"🔄 Converting to **{target.upper()}**...")
             progress_msg = await query.message.reply_text("Starting conversion...")
@@ -658,7 +843,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "✅ Archive received. Choose an action:",
+                "✅ Archive ready. Choose an action:",
                 reply_markup=reply_markup,
             )
 
@@ -699,7 +884,7 @@ def main():
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ Bot started. RAR removed. Multi‑TXT merging with split option enabled.")
+    print("✅ Bot started. Features: Text merge (with split), Archive merge (ZIP/7z), Archive convert/unzip/cleaner.")
     app.run_polling()
 
 if __name__ == "__main__":
